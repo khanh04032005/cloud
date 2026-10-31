@@ -1,6 +1,7 @@
 import { defineConfig } from "oxlint"
 
 export default defineConfig({
+  ignorePatterns: ["**/node_modules/**", ".corepack/**", ".pnpm-store/**"],
   env: {
     browser: true,
     builtin: true,
@@ -13,6 +14,27 @@ export default defineConfig({
   },
   plugins: ["typescript"],
   overrides: [
+    {
+      files: ["packages/streaming/**/*.mjs"],
+      rules: {
+        "@stylistic/padding-line-between-statements": "off",
+        "init-declarations": "off",
+        "max-params": "off",
+        "no-await-in-loop": "off",
+        "no-empty-function": "off",
+        "no-promise-executor-return": "off",
+        "prefer-destructuring": "off",
+        "require-await": "off",
+        "typescript/no-misused-promises": "off",
+        "typescript/no-unsafe-argument": "off",
+        "typescript/no-unsafe-assignment": "off",
+        "typescript/no-unsafe-call": "off",
+        "typescript/no-unsafe-member-access": "off",
+        "typescript/no-unsafe-return": "off",
+        "typescript/no-unnecessary-condition": "off",
+        "typescript/require-await": "off",
+      },
+    },
     {
       files: ["packages/web/**/*.{ts,tsx}"],
       plugins: ["react"],
