@@ -9,5 +9,6 @@ This folder covers the basic setup (config, quizzes, branding) as well as more a
 - [WebSocket Protocol](websocket-protocol.md): the player-facing event protocol, for building custom clients (e.g. a physical buzzer).
 - [HTTP API](http-api.md): the `/api` surface — sessions, quiz and result CRUD, game creation.
 - [Testing](testing.md): running and writing the unit, integration and e2e tests.
+- The [Live Quiz week 1–2 handoff](live-quiz-week-1-2.md) covers the game event flow, PostgreSQL migration, and contracts for streaming and split deployment.
 
 Back to the [main README](../README.md).

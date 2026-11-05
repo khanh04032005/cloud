@@ -20,6 +20,8 @@ const eventValidators: Partial<Record<string, z.ZodType>> =
 
 export const app = new Hono()
 
+app.get("/health/live", (c) => c.json({ status: "ok" }))
+app.get("/health/ready", (c) => c.json({ status: "ok" }))
 app.route("/api", api)
 
 app.notFound((c) =>
