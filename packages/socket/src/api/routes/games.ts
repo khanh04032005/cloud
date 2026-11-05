@@ -1,4 +1,5 @@
 import { zValidator } from "@hono/zod-validator"
+import type { QuizzWithId } from "@razzia/common/types/game"
 import {
   checkGameValidator,
   createGameValidator,
@@ -8,12 +9,61 @@ import {
 import { apiFactory } from "@razzia/socket/api/factory"
 import { requireManager, requireSession } from "@razzia/socket/api/middleware"
 import { i18nHook } from "@razzia/socket/api/validation"
+import { updateCloudRoomSettings } from "@razzia/socket/handlers/game"
 import { mintJoinTicket } from "@razzia/socket/services/auth"
-import { getQuizz } from "@razzia/socket/services/config"
+import { getQuizzById } from "@razzia/socket/services/catalog"
+import { cloud, type RoomAdmission } from "@razzia/socket/services/cloud"
 import Game from "@razzia/socket/services/game"
 import { getIo } from "@razzia/socket/services/io"
 import Registry from "@razzia/socket/services/registry"
 import { StatusCodes } from "http-status-codes"
+
+const findRoom = (
+  inviteCode: string,
+  clientId?: string,
+): RoomAdmission | undefined | Promise<RoomAdmission | undefined> => {
+  if (cloud) {
+    return cloud.findRoom(inviteCode, clientId)
+  }
+
+  const game = Registry.getInstance().getGameByInviteCode(inviteCode)
+
+  if (!game) {
+    return undefined
+  }
+
+  return {
+    gameId: game.gameId,
+    hostClientId: game.manager.clientId,
+    settings: game.settings,
+    locked: game.locked,
+    username:
+      game.players.find((player) => player.clientId === clientId)?.username ??
+      null,
+  }
+}
+
+const createGame = async (
+  hostId: string,
+  quiz: QuizzWithId,
+  attempts = 5,
+): Promise<Game | undefined> => {
+  if (attempts === 0) {
+    return undefined
+  }
+
+  const game = new Game(getIo(), hostId, quiz)
+
+  if (cloud && !(await cloud.createRoom(game, quiz))) {
+    return createGame(hostId, quiz, attempts - 1)
+  }
+
+  const registry = Registry.getInstance()
+  registry.addGame(game)
+  registry.markGameAsEmpty(game)
+
+  return game
+}
 
 const routes = apiFactory
   .createApp()
@@ -21,23 +71,21 @@ const routes = apiFactory
     "/",
     requireManager,
     zValidator("json", createGameValidator, i18nHook),
-    (c) => {
+    async (c) => {
       const { quizzId } = c.req.valid("json")
-      const quizz = getQuizz().find((q) => q.id === quizzId)
+      const quiz = await getQuizzById(quizzId)
+      const game = await createGame(c.get("claims").sub, quiz)
 
-      if (!quizz) {
-        return c.json({ error: "errors:quizz.notFound" }, StatusCodes.NOT_FOUND)
+      if (game) {
+        return c.json(
+          { gameId: game.gameId, inviteCode: game.inviteCode },
+          StatusCodes.CREATED,
+        )
       }
 
-      const registry = Registry.getInstance()
-      const game = new Game(getIo(), c.get("claims").sub, quizz)
-
-      registry.addGame(game)
-      registry.markGameAsEmpty(game)
-
       return c.json(
-        { gameId: game.gameId, inviteCode: game.inviteCode },
-        StatusCodes.CREATED,
+        { error: "errors:api.serverError" },
+        StatusCodes.SERVICE_UNAVAILABLE,
       )
     },
   )
@@ -45,7 +93,38 @@ const routes = apiFactory
     "/:gameId/settings",
     requireManager,
     zValidator("json", gameSettingsValidator, i18nHook),
-    (c) => {
+    async (c) => {
+      if (cloud) {
+        const reply = await updateCloudRoomSettings(
+          c.req.param("gameId"),
+          c.get("claims").sub,
+          c.req.valid("json"),
+        )
+
+        if (reply === "started") {
+          return c.json(
+            { error: "errors:game.alreadyStarted" },
+            StatusCodes.CONFLICT,
+          )
+        }
+
+        if (reply === "missing") {
+          return c.json(
+            { error: "errors:game.notFound" },
+            StatusCodes.NOT_FOUND,
+          )
+        }
+
+        if (typeof reply === "object" && "settings" in reply) {
+          return c.json(reply)
+        }
+
+        return c.json(
+          { error: "errors:api.serverError" },
+          StatusCodes.SERVICE_UNAVAILABLE,
+        )
+      }
+
       const game = Registry.getInstance().getGameById(c.req.param("gameId"))
 
       if (!game || game.manager.clientId !== c.get("claims").sub) {
@@ -62,48 +141,49 @@ const routes = apiFactory
       return c.json({ settings: game.settings })
     },
   )
-  .post("/check", zValidator("json", checkGameValidator, i18nHook), (c) => {
-    const { inviteCode } = c.req.valid("json")
-    const game = Registry.getInstance().getGameByInviteCode(inviteCode)
+  .post(
+    "/check",
+    zValidator("json", checkGameValidator, i18nHook),
+    async (c) => {
+      const { inviteCode } = c.req.valid("json")
+      const game = await findRoom(inviteCode)
 
-    if (!game) {
-      return c.json({ error: "errors:game.notFound" }, StatusCodes.NOT_FOUND)
-    }
+      if (!game) {
+        return c.json({ error: "errors:game.notFound" }, StatusCodes.NOT_FOUND)
+      }
 
-    if (game.locked) {
-      return c.json({ error: "errors:game.locked" }, StatusCodes.FORBIDDEN)
-    }
+      if (game.locked) {
+        return c.json({ error: "errors:game.locked" }, StatusCodes.FORBIDDEN)
+      }
 
-    return c.json({ generatedUsernames: game.settings.generatedUsernames })
-  })
+      return c.json({ generatedUsernames: game.settings.generatedUsernames })
+    },
+  )
   .post(
     "/join",
     requireSession,
     zValidator("json", joinGameValidator, i18nHook),
     async (c) => {
       const { inviteCode, username } = c.req.valid("json")
-      const game = Registry.getInstance().getGameByInviteCode(inviteCode)
+      const { sub } = c.get("claims")
+      const game = await findRoom(inviteCode, sub)
 
       if (!game) {
         return c.json({ error: "errors:game.notFound" }, StatusCodes.NOT_FOUND)
       }
 
-      const { sub } = c.get("claims")
-
-      if (game.manager.clientId === sub) {
+      if (game.hostClientId === sub) {
         return c.json(
           { error: "errors:game.managerCannotJoin" },
           StatusCodes.FORBIDDEN,
         )
       }
 
-      const existing = game.players.find((p) => p.clientId === sub)
-
-      if (existing) {
+      if (game.username !== null) {
         return c.json({
           gameId: game.gameId,
           ticket: null,
-          username: existing.username,
+          username: game.username,
         })
       }
 

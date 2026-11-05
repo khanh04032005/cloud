@@ -1,3 +1,3 @@
-import type { Socket } from "@razzia/common/types/game/socket"
+import type { GameSocket } from "@razzia/socket/handlers/types"
 
-export const getClientId = (socket: Socket): string => socket.data.clientId
+export const getClientId = (socket: GameSocket): string => socket.data.clientId

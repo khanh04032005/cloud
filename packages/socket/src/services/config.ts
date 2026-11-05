@@ -78,17 +78,7 @@ const requireFileById = (subDir: string, id: string, key: string): string => {
 }
 
 export const initConfig = () => {
-  const isConfigFolderExists = fs.existsSync(getPath())
-
-  if (!isConfigFolderExists) {
-    fs.mkdirSync(getPath())
-  }
-
-  const isQuizzExists = fs.existsSync(getPath("quizz"))
-
-  if (!isQuizzExists) {
-    fs.mkdirSync(getPath("quizz"))
-
+  if (fs.mkdirSync(getPath("quizz"), { recursive: true })) {
     fs.writeFileSync(
       getPath("quizz/example.json"),
       JSON.stringify({ id: nanoid(), ...EXAMPLE_QUIZZ }, null, 2),
@@ -193,9 +183,7 @@ export const saveResult = (data: GameResult): void => {
   try {
     const resultsPath = getPath("results")
 
-    if (!fs.existsSync(resultsPath)) {
-      fs.mkdirSync(resultsPath)
-    }
+    fs.mkdirSync(resultsPath, { recursive: true })
 
     fs.writeFileSync(
       join(resultsPath, `${nanoid()}.json`),

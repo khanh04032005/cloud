@@ -3,11 +3,16 @@ import { EVENTS } from "@razzia/common/constants"
 import type { Server } from "@razzia/common/types/game/socket"
 import { clientEventValidators } from "@razzia/common/validators/socket"
 import { api } from "@razzia/socket/api"
-import { gameSocketHandlers } from "@razzia/socket/handlers/game"
+import {
+  gameSocketHandlers,
+  installRoomRouting,
+} from "@razzia/socket/handlers/game"
 import type { SocketHandler } from "@razzia/socket/handlers/types"
 import { verifyToken } from "@razzia/socket/services/auth"
+import { cloud } from "@razzia/socket/services/cloud"
 import { DomainError } from "@razzia/socket/services/errors"
 import { setIo } from "@razzia/socket/services/io"
+import { createAdapter } from "@socket.io/redis-adapter"
 import { Hono } from "hono"
 import { HTTPException } from "hono/http-exception"
 import { JwtTokenExpired } from "hono/utils/jwt/types"
@@ -21,7 +26,13 @@ const eventValidators: Partial<Record<string, z.ZodType>> =
 export const app = new Hono()
 
 app.get("/health/live", (c) => c.json({ status: "ok" }))
-app.get("/health/ready", (c) => c.json({ status: "ok" }))
+app.get("/health/ready", async (c) => {
+  if (cloud && !(await cloud.ready())) {
+    return c.json({ status: "unavailable" }, StatusCodes.SERVICE_UNAVAILABLE)
+  }
+
+  return c.json({ status: "ok" })
+})
 app.route("/api", api)
 
 app.notFound((c) =>
@@ -71,7 +82,17 @@ const authError = (code: string, message: string) => {
 export const createSocketServer = (server: ServerType): Server => {
   const io: Server = new ServerIO(server, {
     path: "/ws",
+    ...(cloud && { transports: ["websocket"] }),
   })
+
+  if (cloud) {
+    io.adapter(
+      createAdapter(cloud.redis, cloud.subscriber, {
+        publishOnSpecificResponseChannel: true,
+      }),
+    )
+    installRoomRouting(io)
+  }
 
   setIo(io)
 

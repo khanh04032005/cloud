@@ -18,12 +18,13 @@ import type {
   Quizz,
   QuizzMode,
 } from "@razzia/common/types/game"
-import type { Server, Socket } from "@razzia/common/types/game/socket"
+import type { Server } from "@razzia/common/types/game/socket"
 import {
   type Status,
   STATUS,
   type StatusDataMap,
 } from "@razzia/common/types/game/status"
+import type { GameSocket } from "@razzia/socket/handlers/types"
 import { CooldownTimer } from "@razzia/socket/services/game/cooldown-timer"
 import { PlayerManager } from "@razzia/socket/services/game/player-manager"
 import {
@@ -56,6 +57,12 @@ export interface RoundManagerOptions {
   send: SendFn
   onNewQuestion: () => void
   onGameFinished: (_result: GameResult) => void
+  savePhase?: (
+    _phase: "running" | "open" | "closed" | "finished",
+    _position?: number,
+    _closesAt?: Date | null,
+  ) => Promise<void>
+  onFailure: (_error: unknown) => void
   getSettings: () => GameSettings
 }
 
@@ -111,6 +118,11 @@ export class RoundManager {
 
   isStarted(): boolean {
     return this.started
+  }
+
+  stop(): void {
+    this.started = false
+    this.acceptingAnswers = false
   }
 
   private get question(): Question {
@@ -192,7 +204,7 @@ export class RoundManager {
     }
   }
 
-  async start(socket: Socket): Promise<void> {
+  async start(socket: GameSocket): Promise<void> {
     if (this.started) {
       return
     }
@@ -205,17 +217,38 @@ export class RoundManager {
 
     this.started = true
 
+    if (this.opts.savePhase) {
+      await this.opts.savePhase("running")
+    }
+
     this.opts.broadcast(STATUS.SHOW_START, {
       time: 3,
       subject: this.opts.quizz.subject,
     })
 
+    const countdown = this.startCountdown()
+
+    if (this.opts.savePhase) {
+      // The coordinator can process joins once the initial database writes commit.
+      void countdown.catch(this.opts.onFailure)
+
+      return
+    }
+
+    await countdown
+  }
+
+  private async startCountdown(): Promise<void> {
     await sleep(3)
+
+    if (!this.started) {
+      return
+    }
 
     this.opts.io.to(this.opts.gameId).emit(EVENTS.GAME.START_COOLDOWN)
     await this.opts.cooldown.start(3)
 
-    void this.newQuestion()
+    this.beginQuestion()
   }
 
   advance(): void {
@@ -263,7 +296,11 @@ export class RoundManager {
     }
 
     this.currentQuestion += 1
-    void this.newQuestion()
+    this.beginQuestion()
+  }
+
+  private beginQuestion(): void {
+    void this.newQuestion().catch(this.opts.onFailure)
   }
 
   private async newQuestion(): Promise<void> {
@@ -313,6 +350,19 @@ export class RoundManager {
     }
 
     this.startTime = Date.now()
+
+    if (this.opts.savePhase) {
+      const closesAt =
+        this.question.time === NO_TIME_LIMIT
+          ? null
+          : new Date(this.startTime + this.question.time * SECOND_MS)
+      await this.opts.savePhase("open", this.currentQuestion + 1, closesAt)
+
+      if (!this.started) {
+        return
+      }
+    }
+
     this.acceptingAnswers = true
 
     this.opts.broadcast(STATUS.SELECT_ANSWER, {
@@ -329,6 +379,14 @@ export class RoundManager {
     await this.opts.cooldown.start(this.question.time)
 
     this.acceptingAnswers = false
+
+    if (!this.started) {
+      return
+    }
+
+    if (this.opts.savePhase) {
+      await this.opts.savePhase("closed", this.currentQuestion + 1)
+    }
 
     if (!this.started) {
       return
@@ -454,6 +512,7 @@ export class RoundManager {
   private finish(): void {
     this.started = false
     this.clearAutoAdvance()
+    void this.opts.savePhase?.("finished").catch(this.opts.onFailure)
 
     const finalPlayers = this.isSurvey()
       ? this.opts.players.getAll()
@@ -518,7 +577,7 @@ export class RoundManager {
     return [Math.min(options.max, Math.max(options.min, value))]
   }
 
-  selectAnswer(socket: Socket, answerIds: number[]): void {
+  selectAnswer(socket: GameSocket, answerIds: number[]): void {
     const player = this.opts.players.findById(socket.id)
 
     if (!player || !this.acceptingAnswers) {

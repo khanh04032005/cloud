@@ -41,6 +41,16 @@ The Vitest config lives in `vitest.config.ts` and splits the tests into three pr
 
 The server returns translation keys (`errors:game.notFound`), not texts, so tests check the keys.
 
+### Two-replica integration test
+
+Use two socket processes with the same test PostgreSQL database, Redis instance, JWT secret and manager password. Apply the migrations in [Shared room state](configuration.md#shared-room-state) first. The test creates a room and plays one round. Set `GAME_SPEED=5` on both servers to shorten the startup countdown.
+
+```sh
+CLOUD_TEST_A=http://localhost:3001 CLOUD_TEST_B=http://localhost:3002 \
+  CLOUD_TEST_DATABASE_URL="$DATABASE_URL" CLOUD_TEST_REDIS_URL="$REDIS_URL" \
+  CLOUD_TEST_MANAGER_PASSWORD=test-password pnpm test --project socket cloud.test.ts
+```
+
 ## End-to-end tests
 
 ```

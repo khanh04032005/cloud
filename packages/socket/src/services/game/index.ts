@@ -5,12 +5,14 @@ import type {
   Quizz,
   QuizzMode,
 } from "@razzia/common/types/game"
-import type { Server, Socket } from "@razzia/common/types/game/socket"
+import type { Server } from "@razzia/common/types/game/socket"
 import {
   STATUS,
   type Status,
   type StatusDataMap,
 } from "@razzia/common/types/game/status"
+import type { GameSocket } from "@razzia/socket/handlers/types"
+import { cloud } from "@razzia/socket/services/cloud"
 import { saveResult } from "@razzia/socket/services/config"
 import { CooldownTimer } from "@razzia/socket/services/game/cooldown-timer"
 import { PlayerManager } from "@razzia/socket/services/game/player-manager"
@@ -79,6 +81,7 @@ class Game {
       isStarted: () => this.started,
     })
 
+    const storage = cloud
     this.round = new RoundManager({
       quizz,
       players: this.playerManager,
@@ -93,6 +96,16 @@ class Game {
         this.managerStatus = null
       },
       onGameFinished: saveResult,
+      savePhase:
+        storage &&
+        (async (phase, position, closesAt) => {
+          if (phase === "running") {
+            await storage.prunePlayers(this)
+          }
+
+          await storage.phase(this.gameId, { phase, position, closesAt })
+        }),
+      onFailure: (error) => this.fail(error),
       getSettings: () => this._settings,
     })
 
@@ -132,8 +145,20 @@ class Game {
   }
 
   setLocked(locked: boolean) {
+    const previous = this._locked
     this._locked = locked
-    this.io.to(this._manager.id).emit(EVENTS.MANAGER.LOCK_UPDATED, locked)
+    const notify = () => {
+      this.io.to(this._manager.id).emit(EVENTS.MANAGER.LOCK_UPDATED, locked)
+    }
+
+    if (!cloud) {
+      return notify()
+    }
+
+    return cloud.saveLobby(this).then(notify, (error: unknown) => {
+      this._locked = previous
+      throw error
+    })
   }
 
   // ── Status broadcasting ──────────────────────────────────────────────────
@@ -162,28 +187,39 @@ class Game {
 
   // Player actions
 
-  join(socket: Socket, username?: string): string | null {
+  join(socket: GameSocket, username?: string) {
     if (this._locked) {
       return "errors:game.locked"
     }
 
+    const storage = cloud
+    const persist =
+      storage && ((player: Player) => storage.savePlayer(this.gameId, player))
+
     if (this._settings.generatedUsernames) {
       const taken = this.playerManager.getAll().map((player) => player.username)
 
-      return this.playerManager.join(socket, createNickname(taken))
+      return this.playerManager.join(socket, createNickname(taken), persist)
     }
 
     if (!username) {
       return "errors:auth.usernameTooShort"
     }
 
-    return this.playerManager.join(socket, username)
+    return this.playerManager.join(socket, username, persist)
   }
 
   dispose() {
+    this.round.stop()
     this.round.clearAutoAdvance()
     this.cooldown.abort()
     this.cancelManagerGrace()
+  }
+
+  private fail(error: unknown) {
+    console.error(`Room ${this.gameId} failed:`, error)
+    this.io.to(this.gameId).emit(EVENTS.GAME.RESET, "errors:api.serverError")
+    registry.removeGame(this.gameId)
   }
 
   waitForManager(onTimeout: () => void) {
@@ -212,7 +248,7 @@ class Game {
 
   // Reconnect
 
-  reconnect(socket: Socket) {
+  reconnect(socket: GameSocket) {
     const clientId = getClientId(socket)
 
     if (this._manager.clientId === clientId) {
@@ -224,7 +260,7 @@ class Game {
     this.reconnectPlayer(socket)
   }
 
-  private reconnectManager(socket: Socket) {
+  private reconnectManager(socket: GameSocket) {
     const previousSocketId = this._manager.connected ? this._manager.id : null
 
     socket.join(this.gameId)
@@ -272,7 +308,7 @@ class Game {
     console.log(`Manager reconnected to game ${this.inviteCode}`)
   }
 
-  private reconnectPlayer(socket: Socket) {
+  private reconnectPlayer(socket: GameSocket) {
     const clientId = getClientId(socket)
     const player = this.playerManager.findByClientId(clientId)
 
@@ -365,7 +401,7 @@ class Game {
     this.cooldown.abort()
   }
 
-  async start(socket: Socket) {
+  async start(socket: GameSocket) {
     if (!this.started) {
       const away = this.playerManager.getAll().filter((p) => !p.connected)
 
@@ -374,10 +410,14 @@ class Game {
       }
     }
 
-    await this.round.start(socket)
+    try {
+      await this.round.start(socket)
+    } catch (error) {
+      this.fail(error)
+    }
   }
 
-  selectAnswer(socket: Socket, answerIds: number[]) {
+  selectAnswer(socket: GameSocket, answerIds: number[]) {
     this.round.selectAnswer(socket, answerIds)
   }
 

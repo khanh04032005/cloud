@@ -1,4 +1,5 @@
 import type Game from "@razzia/socket/services/game"
+import { cloud } from "@razzia/socket/services/cloud"
 import dayjs from "dayjs"
 
 interface EmptyGame {
@@ -91,6 +92,7 @@ class Registry {
 
     if (game) {
       game.dispose()
+      void cloud?.removeRoom(gameId).catch(console.error)
     }
 
     this.games = this.games.filter((g) => g.gameId !== gameId)
@@ -134,6 +136,7 @@ class Registry {
 
     removed.forEach((g) => {
       g.game.dispose()
+      void cloud?.removeRoom(g.game.gameId).catch(console.error)
     })
     this.games = this.games.filter((g) => !removedGameIds.includes(g.gameId))
     this.emptyGames = stillEmpty
@@ -161,6 +164,9 @@ class Registry {
 
   cleanup(): void {
     this.stopCleanupTask()
+    for (const game of this.games) {
+      game.dispose()
+    }
     this.games = []
     this.emptyGames = []
     console.log("Registry cleaned up")
