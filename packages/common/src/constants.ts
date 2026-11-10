@@ -13,6 +13,7 @@ export const EVENTS = {
     PLAYER_ANSWER: "game:playerAnswer",
   },
   PLAYER: {
+    ANSWER_ACK: "player:answerAck",
     SUCCESS_RECONNECT: "player:successReconnect",
     UPDATE_LEADERBOARD: "player:updateLeaderboard",
     LOGIN: "player:login",

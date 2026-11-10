@@ -37,7 +37,7 @@ export const withPlayerGame = (
   gameId: string | undefined,
   socket: GameSocket,
   callback: GameCallback,
-): void => {
+) => {
   const game = resolveGame(gameId)
 
   if (!game) {
@@ -52,7 +52,7 @@ export const withPlayerGame = (
     return
   }
 
-  callback(game)
+  return callback(game)
 }
 
 export const createInviteCode = (length = 6) => {

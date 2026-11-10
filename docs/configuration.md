@@ -44,18 +44,19 @@ Both print 64 hexadecimal characters, the same shape the server generates for it
 
 ## Shared room state
 
-Apply both migrations in order on a new database. For a database already initialized in week 2, apply `002_shared_room_state.sql` only.
+Apply the migrations below in order on a new database. Apply each migration once. For an existing database, apply only the migrations that have not been run.
 
 ```sh
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/socket/migrations/001_live_quiz.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/socket/migrations/002_shared_room_state.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/socket/migrations/003_durable_answers.sql
 ```
 
 Set both connection URLs and a shared `JWT_SECRET` on every socket replica. Start the first replica with the existing `config/quizz/` directory mounted if you want to import existing quizzes. Startup imports that directory into PostgreSQL once per database and preserves quiz IDs. Subsequent quiz edits use PostgreSQL. Standalone mode uses the file catalog when both URLs are empty.
 
 In cloud mode PostgreSQL holds the quiz catalog, rooms, player membership and round snapshots. Redis holds the active room's coordinator and current round phase and carries Socket.IO messages between replicas. Route `/api` and `/ws` to the socket service. The socket gateway accepts the WebSocket transport and `/health/ready` checks PostgreSQL and Redis connectivity.
 
-Each room's coordinator runs the Razzia engine and its timers. A host or player can connect through another replica while that coordinator is running. Recovery after the coordinator exits is planned with the database reconnect and Redis lease work. This milestone still uses the baseline answer handling, scoring and result files. Mount the same writable `config/results/` directory on socket replicas if the manager needs to access result files through any replica.
+Each room's coordinator runs the Razzia engine and its timers. Cloud answers and their outbox events are committed together. The backend reads scores written by B's worker and waits for all accepted answers before showing round results. Player reconnect and new result reports use PostgreSQL. Recovery of the game engine and timer after the coordinator exits is planned with the Redis lease work. The [week 4 handoff](live-quiz-week-4.md) describes the worker contract and reconnect behavior. Legacy result files remain available from their original directory.
 
 ## The `config` folder
 

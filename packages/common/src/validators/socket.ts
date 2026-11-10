@@ -23,6 +23,7 @@ export const clientEventValidators = {
   [EVENTS.PLAYER.RECONNECT]: gameMessageValidator,
   [EVENTS.PLAYER.LEAVE]: gameMessageValidator,
   [EVENTS.PLAYER.SELECTED_ANSWER]: gameMessageValidator.extend({
+    roundId: z.uuid().optional(),
     data: z.object({ answerKeys: answerKeysValidator }),
   }),
 }

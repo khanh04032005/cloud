@@ -59,12 +59,19 @@ export interface ServerToClientEvents {
   [EVENTS.GAME.PLAYER_ANSWER]: (_count: number) => void
 
   // Player events
+  [EVENTS.PLAYER.ANSWER_ACK]: (_data: {
+    status: "accepted" | "duplicate" | "closed" | "invalid" | "forbidden"
+    roundId?: string
+    answerKeys?: number[]
+    acceptedAt?: string
+  }) => void
   [EVENTS.PLAYER.SUCCESS_RECONNECT]: (_data: {
     gameId: string
     gameMode: QuizzMode
     status: { name: Status; data: StatusDataMap[Status] }
     player: { username: string; points: number }
     currentQuestion: GameUpdateQuestion | null
+    acceptedAnswer?: { answerKeys: number[]; acceptedAt: string } | null
   }) => void
   [EVENTS.PLAYER.UPDATE_LEADERBOARD]: (_data: { leaderboard: Player[] }) => void
 

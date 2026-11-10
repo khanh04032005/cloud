@@ -10,6 +10,7 @@ import {
 import type { SocketHandler } from "@razzia/socket/handlers/types"
 import { verifyToken } from "@razzia/socket/services/auth"
 import { cloud } from "@razzia/socket/services/cloud"
+import { CloudGame } from "@razzia/socket/services/cloud-game"
 import { DomainError } from "@razzia/socket/services/errors"
 import { setIo } from "@razzia/socket/services/io"
 import { createAdapter } from "@socket.io/redis-adapter"
@@ -18,7 +19,7 @@ import { HTTPException } from "hono/http-exception"
 import { JwtTokenExpired } from "hono/utils/jwt/types"
 import { StatusCodes } from "http-status-codes"
 import { Server as ServerIO } from "socket.io"
-import type { z } from "zod"
+import { z } from "zod"
 
 const eventValidators: Partial<Record<string, z.ZodType>> =
   clientEventValidators
@@ -92,6 +93,35 @@ export const createSocketServer = (server: ServerType): Server => {
       }),
     )
     installRoomRouting(io)
+    const storage = cloud
+    void storage.subscriber
+      .subscribe("razzia:leaderboard", (message) => {
+        try {
+          const notification: unknown = JSON.parse(message)
+          const result = z.object({ room_id: z.uuid() }).safeParse(notification)
+
+          if (!result.success) {
+            return
+          }
+
+          const roomId = result.data.room_id
+          void new CloudGame(storage, roomId)
+            .scores(0)
+            .then((scores) => {
+              io.local.to(roomId).emit(EVENTS.PLAYER.UPDATE_LEADERBOARD, {
+                leaderboard: scores.filter((player) => player.active),
+              })
+            })
+            .catch((error: unknown) =>
+              console.error("Leaderboard read failed:", error),
+            )
+        } catch (error) {
+          console.error("Invalid leaderboard notification:", error)
+        }
+      })
+      .catch((error: unknown) =>
+        console.error("Leaderboard subscription failed:", error),
+      )
   }
 
   setIo(io)

@@ -25,6 +25,7 @@ import {
   type StatusDataMap,
 } from "@razzia/common/types/game/status"
 import type { GameSocket } from "@razzia/socket/handlers/types"
+import type { CloudGame } from "@razzia/socket/services/cloud-game"
 import { CooldownTimer } from "@razzia/socket/services/game/cooldown-timer"
 import { PlayerManager } from "@razzia/socket/services/game/player-manager"
 import {
@@ -39,12 +40,12 @@ import { nanoid } from "nanoid"
 type BroadcastFn = <T extends Status>(
   _status: T,
   _data: StatusDataMap[T],
-) => void
+) => void | Promise<void>
 type SendFn = <T extends Status>(
   _target: string,
   _status: T,
   _data: StatusDataMap[T],
-) => void
+) => void | Promise<void>
 
 export interface RoundManagerOptions {
   quizz: Quizz
@@ -56,7 +57,8 @@ export interface RoundManagerOptions {
   broadcast: BroadcastFn
   send: SendFn
   onNewQuestion: () => void
-  onGameFinished: (_result: GameResult) => void
+  onGameFinished: (_result: GameResult) => void | Promise<void>
+  persistence?: CloudGame
   savePhase?: (
     _phase: "running" | "open" | "closed" | "finished",
     _position?: number,
@@ -70,7 +72,7 @@ interface RoundStep {
   name: string
   gameModes: QuizzMode[]
   skip?: () => boolean
-  enter: () => void
+  enter: () => void | Promise<void>
   delay: (_settings: GameSettings) => number
 }
 
@@ -87,6 +89,7 @@ export class RoundManager {
   private tempOldLeaderboard: Player[] | null = null
   private questionsHistory: QuestionResult[] = []
   private autoAdvanceTimer: NodeJS.Timeout | null = null
+  private processing = false
 
   constructor(opts: RoundManagerOptions) {
     this.opts = opts
@@ -95,18 +98,14 @@ export class RoundManager {
       {
         name: "reveal",
         gameModes: [QUIZZ_MODES.QUIZ, QUIZZ_MODES.SURVEY],
-        enter: () => {
-          this.showResults()
-        },
+        enter: () => this.showResults(),
         delay: (settings) => settings.autoAdvance.responsesDelay,
       },
       {
         name: "leaderboard",
         gameModes: [QUIZZ_MODES.QUIZ],
         skip: () => this.isLastQuestion() || this.isSameCategoryNext(),
-        enter: () => {
-          this.showLeaderboard()
-        },
+        enter: () => this.showLeaderboard(),
         delay: (settings) => settings.autoAdvance.leaderboardDelay,
       },
     ]
@@ -204,6 +203,10 @@ export class RoundManager {
     }
   }
 
+  get position(): number {
+    return this.currentQuestion + 1
+  }
+
   async start(socket: GameSocket): Promise<void> {
     if (this.started) {
       return
@@ -221,7 +224,7 @@ export class RoundManager {
       await this.opts.savePhase("running")
     }
 
-    this.opts.broadcast(STATUS.SHOW_START, {
+    await this.opts.broadcast(STATUS.SHOW_START, {
       time: 3,
       subject: this.opts.quizz.subject,
     })
@@ -252,7 +255,7 @@ export class RoundManager {
   }
 
   advance(): void {
-    if (!this.started) {
+    if (!this.started || this.processing) {
       return
     }
 
@@ -284,13 +287,27 @@ export class RoundManager {
     }
 
     this.currentStep = index
-    step.enter()
-    this.scheduleAutoAdvance(step.delay(this.opts.getSettings()))
+    const entered = step.enter()
+
+    if (entered instanceof Promise) {
+      this.processing = true
+      void entered
+        .then(() => {
+          this.processing = false
+
+          if (this.started) {
+            this.scheduleAutoAdvance(step.delay(this.opts.getSettings()))
+          }
+        })
+        .catch(this.opts.onFailure)
+    } else {
+      this.scheduleAutoAdvance(step.delay(this.opts.getSettings()))
+    }
   }
 
   private nextQuestion(): void {
     if (this.isLastQuestion()) {
-      this.finish()
+      void this.finish()
 
       return
     }
@@ -317,7 +334,7 @@ export class RoundManager {
       total: this.opts.quizz.questions.length,
     })
 
-    this.opts.broadcast(STATUS.SHOW_PREPARED, {
+    await this.opts.broadcast(STATUS.SHOW_PREPARED, {
       totalAnswers: this.question.answers.length,
       questionNumber: this.currentQuestion + 1,
       questionType: this.question.type,
@@ -337,7 +354,7 @@ export class RoundManager {
       return this.question.media
     })()
 
-    this.opts.broadcast(STATUS.SHOW_QUESTION, {
+    await this.opts.broadcast(STATUS.SHOW_QUESTION, {
       question: this.question.question,
       media: imageMedia,
       cooldown: this.question.cooldown,
@@ -365,7 +382,9 @@ export class RoundManager {
 
     this.acceptingAnswers = true
 
-    this.opts.broadcast(STATUS.SELECT_ANSWER, {
+    const roundId = await this.opts.persistence?.roundId(this.position)
+    await this.opts.broadcast(STATUS.SELECT_ANSWER, {
+      ...(roundId && { roundId }),
       question: this.question.question,
       answers: this.question.answers,
       media: this.question.media,
@@ -418,7 +437,11 @@ export class RoundManager {
     })
   }
 
-  private showResults(): void {
+  private showResults(): void | Promise<void> {
+    if (this.opts.persistence) {
+      return this.showCloudResults(this.opts.persistence)
+    }
+
     const currentPlayers = this.opts.players.getAll()
     const answerCounts = countAnswers(this.playersAnswers)
 
@@ -465,7 +488,7 @@ export class RoundManager {
         message: player.lastCorrect ? "game:correct" : "game:wrong",
         points: player.lastPoints,
         myPoints: player.points,
-        rank: index + 1,
+        rank: player.rank ?? index + 1,
         aheadOfMe: aheadPlayer ? aheadPlayer.username : null,
       })
     })
@@ -482,15 +505,72 @@ export class RoundManager {
     this.playersAnswers = []
   }
 
-  private showLeaderboard(): void {
+  private async showCloudResults(persistence: CloudGame) {
+    if (!(await persistence.waitForScores(this.position, () => this.started))) {
+      return
+    }
+
+    const scored = await persistence.scores(this.position)
+    const oldLeaderboard = this.leaderboard.length
+      ? this.leaderboard
+      : this.opts.players.getAll().map((player) => ({ ...player }))
+    this.playersAnswers = scored
+      .filter((player) => player.answer_keys !== null)
+      .map((player) => ({
+        playerId: player.id,
+        answerIds: player.answer_keys ?? [],
+        points: player.lastPoints,
+      }))
+    const active = scored.filter((player) => player.active)
+    this.opts.players.replace(active)
+    this.recordHistory(scored, this.isSurvey() ? [] : scored)
+    await Promise.all(
+      active.map((player, index) =>
+        Promise.resolve(
+          this.opts.send(
+            player.id,
+            this.isSurvey() ? STATUS.WAIT : STATUS.SHOW_RESULT,
+            this.isSurvey()
+              ? { text: "game:answerNoted" }
+              : {
+                  correct: player.lastCorrect,
+                  message: player.lastCorrect ? "game:correct" : "game:wrong",
+                  points: player.lastPoints,
+                  myPoints: player.points,
+                  rank: player.rank ?? index + 1,
+                  aheadOfMe:
+                    active.find((other) => other.points > player.points)
+                      ?.username ?? null,
+                },
+          ),
+        ),
+      ),
+    )
+    await this.opts.send(this.opts.getManagerId(), STATUS.SHOW_RESPONSES, {
+      ...this.question,
+      ...(this.isSurvey() && { solutions: undefined }),
+      responses: countAnswers(this.playersAnswers),
+    })
+    this.leaderboard = active
+    this.tempOldLeaderboard ??= oldLeaderboard
+    this.playersAnswers = []
+  }
+
+  private showLeaderboard(): void | Promise<void> {
     const oldLeaderboard = this.tempOldLeaderboard ?? this.leaderboard
 
-    this.opts.send(this.opts.getManagerId(), STATUS.SHOW_LEADERBOARD, {
-      oldLeaderboard: oldLeaderboard.slice(0, 5),
-      leaderboard: this.leaderboard.slice(0, 5),
-    })
+    const sent = this.opts.send(
+      this.opts.getManagerId(),
+      STATUS.SHOW_LEADERBOARD,
+      {
+        oldLeaderboard: oldLeaderboard.slice(0, 5),
+        leaderboard: this.leaderboard.slice(0, 5),
+      },
+    )
 
     this.tempOldLeaderboard = null
+
+    return sent
   }
 
   private finishSurvey(): void {
@@ -509,7 +589,13 @@ export class RoundManager {
     })
   }
 
-  private finish(): void {
+  private finish(): void | Promise<void> {
+    if (this.opts.persistence) {
+      this.processing = true
+
+      return this.finishCloud(this.opts.persistence).catch(this.opts.onFailure)
+    }
+
     this.started = false
     this.clearAutoAdvance()
     void this.opts.savePhase?.("finished").catch(this.opts.onFailure)
@@ -526,7 +612,7 @@ export class RoundManager {
       players: finalPlayers.map((player, index) => ({
         username: player.username,
         points: player.points,
-        rank: index + 1,
+        rank: player.rank ?? index + 1,
       })),
       questions: this.questionsHistory,
     })
@@ -539,7 +625,11 @@ export class RoundManager {
 
     const top = this.leaderboard
       .slice(0, 3)
-      .map(({ username, points }) => ({ username, points }))
+      .map(({ username, points, rank }) => ({
+        username,
+        points,
+        ...(rank && { rank }),
+      }))
 
     this.opts.send(this.opts.getManagerId(), STATUS.FINISHED, {
       subject: this.opts.quizz.subject,
@@ -550,9 +640,75 @@ export class RoundManager {
       this.opts.send(player.id, STATUS.FINISHED, {
         subject: this.opts.quizz.subject,
         top,
-        rank: index + 1,
+        rank: player.rank ?? index + 1,
       })
     })
+  }
+
+  private async finishCloud(persistence: CloudGame) {
+    this.clearAutoAdvance()
+
+    if (!(await persistence.waitForScores(null, () => this.started))) {
+      return
+    }
+
+    const players = await persistence.scores(this.position)
+    const report: GameResult = {
+      id: `${Date.now()}-${nanoid(8)}`,
+      gameMode: this.opts.quizz.gameMode,
+      subject: this.opts.quizz.subject,
+      date: new Date().toISOString(),
+      players: players.map((player, index) => ({
+        username: player.username,
+        points: player.points,
+        rank: player.rank ?? index + 1,
+      })),
+      questions: this.questionsHistory,
+    }
+    await this.opts.onGameFinished(report)
+    await this.opts.savePhase?.("finished")
+    this.started = false
+    this.processing = false
+
+    if (this.isSurvey()) {
+      const data = {
+        subject: report.subject,
+        totalPlayers: players.length,
+        totalQuestions: report.questions.length,
+      }
+      await persistence.broadcast({ name: STATUS.SUMMARY, data }, this.position)
+      await Promise.all(
+        [
+          this.opts.getManagerId(),
+          ...players
+            .filter((player) => player.active)
+            .map((player) => player.id),
+        ].map((id) =>
+          Promise.resolve(this.opts.send(id, STATUS.SUMMARY, data)),
+        ),
+      )
+
+      return
+    }
+
+    const top = players
+      .slice(0, 3)
+      .map(({ username, points, rank }) => ({ username, points, rank }))
+    const data = { subject: report.subject, top }
+    await persistence.broadcast({ name: STATUS.FINISHED, data }, this.position)
+    await this.opts.send(this.opts.getManagerId(), STATUS.FINISHED, data)
+    await Promise.all(
+      players
+        .filter((player) => player.active)
+        .map((player, index) =>
+          Promise.resolve(
+            this.opts.send(player.id, STATUS.FINISHED, {
+              ...data,
+              rank: player.rank ?? index + 1,
+            }),
+          ),
+        ),
+    )
   }
 
   // ── Player actions ───────────────────────────────────────────────────────
@@ -577,7 +733,15 @@ export class RoundManager {
     return [Math.min(options.max, Math.max(options.min, value))]
   }
 
-  selectAnswer(socket: GameSocket, answerIds: number[]): void {
+  selectAnswer(
+    socket: GameSocket,
+    answerIds: number[],
+    roundId?: string,
+  ): void | Promise<void> {
+    if (this.opts.persistence) {
+      return this.selectCloudAnswer(socket, answerIds, roundId)
+    }
+
     const player = this.opts.players.findById(socket.id)
 
     if (!player || !this.acceptingAnswers) {
@@ -624,6 +788,61 @@ export class RoundManager {
       .to(this.opts.gameId)
       .emit(EVENTS.GAME.PLAYER_ANSWER, this.playersAnswers.length)
     this.opts.players.broadcastCount()
+    this.endIfEveryoneAnswered()
+  }
+
+  private async selectCloudAnswer(
+    socket: GameSocket,
+    keys: number[],
+    roundId?: string,
+  ) {
+    const { persistence } = this.opts
+
+    if (!persistence) {
+      return
+    }
+
+    const receipt = await persistence.accept({
+      playerId: socket.data.clientId,
+
+      socketId: socket.id,
+      position: this.position,
+      roundId,
+      keys,
+    })
+    socket.emit(EVENTS.PLAYER.ANSWER_ACK, receipt)
+
+    if (receipt.status !== "accepted" && receipt.status !== "duplicate") {
+      return
+    }
+
+    if (
+      !this.acceptingAnswers ||
+      receipt.roundId !== (await persistence.roundId(this.position))
+    ) {
+      return
+    }
+
+    const player = this.opts.players.findById(socket.id)
+
+    if (!player) {
+      return
+    }
+
+    if (!this.playersAnswers.some((answer) => answer.playerId === player.id)) {
+      this.playersAnswers.push({
+        playerId: player.id,
+        answerIds: receipt.answerKeys ?? [],
+        points: 0,
+      })
+    }
+
+    await this.opts.send(socket.id, STATUS.WAIT, {
+      text: "game:waitingForAnswers",
+    })
+    socket
+      .to(this.opts.gameId)
+      .emit(EVENTS.GAME.PLAYER_ANSWER, this.playersAnswers.length)
     this.endIfEveryoneAnswered()
   }
 

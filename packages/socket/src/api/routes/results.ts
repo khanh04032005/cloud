@@ -4,16 +4,16 @@ import {
   deleteResult,
   getResultById,
   getResultsMeta,
-} from "@razzia/socket/services/config"
+} from "@razzia/socket/services/reports"
 import { StatusCodes } from "http-status-codes"
 
 const routes = apiFactory
   .createApp()
   .use(requireManager)
-  .get("/", (c) => c.json({ results: getResultsMeta() }))
-  .get("/:id", (c) => c.json(getResultById(c.req.param("id"))))
-  .delete("/:id", (c) => {
-    deleteResult(c.req.param("id"))
+  .get("/", async (c) => c.json({ results: await getResultsMeta() }))
+  .get("/:id", async (c) => c.json(await getResultById(c.req.param("id"))))
+  .delete("/:id", async (c) => {
+    await deleteResult(c.req.param("id"))
 
     return c.body(null, StatusCodes.NO_CONTENT)
   })

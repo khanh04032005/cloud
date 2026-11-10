@@ -8,6 +8,7 @@ import type {
 import type { GameSocket, SocketContext } from "@razzia/socket/handlers/types"
 import { verifyJoinTicket } from "@razzia/socket/services/auth"
 import { cloud } from "@razzia/socket/services/cloud"
+import { CloudGame } from "@razzia/socket/services/cloud-game"
 import Game from "@razzia/socket/services/game"
 import { getIo } from "@razzia/socket/services/io"
 import Registry from "@razzia/socket/services/registry"
@@ -84,12 +85,12 @@ const bindGameHandlers = (io: Server, socket: GameSocket, on: Register) => {
   }
 
   on(EVENTS.PLAYER.RECONNECT, ({ gameId }) => {
-    const game = registry.getPlayerGame(gameId, clientId)
+    const game = cloud
+      ? registry.getGameById(gameId)
+      : registry.getPlayerGame(gameId, clientId)
 
     if (game) {
-      game.reconnect(socket)
-
-      return
+      return game.reconnect(socket)
     }
 
     socket.emit(EVENTS.GAME.RESET, "errors:game.notFound")
@@ -141,9 +142,9 @@ const bindGameHandlers = (io: Server, socket: GameSocket, on: Register) => {
     withManagerGame(gameId, socket, (game) => game.start(socket)),
   )
 
-  on(EVENTS.PLAYER.SELECTED_ANSWER, ({ gameId, data }) =>
+  on(EVENTS.PLAYER.SELECTED_ANSWER, ({ gameId, data, roundId }) =>
     withPlayerGame(gameId, socket, (game) =>
-      game.selectAnswer(socket, data.answerKeys),
+      game.selectAnswer(socket, data.answerKeys, roundId),
     ),
   )
 
@@ -187,7 +188,10 @@ const bindGameHandlers = (io: Server, socket: GameSocket, on: Register) => {
       : registry.getGameByPlayerSocketId(socket.id)
 
     if (playerGame?.players.some(({ id }) => id === socket.id)) {
-      playerGame.setPlayerDisconnected(socket.id, reason === "ping timeout")
+      return playerGame.setPlayerDisconnected(
+        socket.id,
+        reason === "ping timeout",
+      )
     }
   }
 }
@@ -263,7 +267,7 @@ const runCommand = (io: Server, command: Command, localSocket?: GameSocket) => {
       })
 
       if (command.event === "disconnect") {
-        disconnect(command.reason, command.gameId)
+        await disconnect(command.reason, command.gameId)
       } else {
         await callbacks.get(command.event)?.(...(command.args as never[]))
       }
@@ -339,6 +343,19 @@ export const updateCloudRoomSettings = (
   settings: Partial<GameSettings>,
 ) => routeCommand(getIo(), { event: "settings", gameId, clientId, settings })
 
+const routeSocketCommand = (
+  io: Server,
+  command: SocketCommand,
+  socket: GameSocket,
+) =>
+  routeCommand(io, command, socket).catch((error: unknown): Reply => {
+    if (command.event === EVENTS.PLAYER.RECONNECT) {
+      return "missing"
+    }
+
+    throw error
+  })
+
 export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
   // Socket.IO's reserved-event overload cannot narrow a generic application event.
   const register = socket.on.bind(socket) as Register
@@ -351,6 +368,7 @@ export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
   }
 
   const rooms = new Set<string>()
+  const storage = cloud
   let pending = Promise.resolve()
   const enqueue = (action: () => Promise<void>) => {
     pending = pending.then(action).catch((error: unknown) => {
@@ -373,11 +391,28 @@ export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
             return
           }
 
-          const reply = await routeCommand(
+          let reply = await routeSocketCommand(
             io,
             { gameId, event, args, socketId: socket.id, data: socket.data },
             socket,
           )
+
+          if (reply === "missing" && event === EVENTS.PLAYER.RECONNECT) {
+            const restored = await new CloudGame(storage, gameId).reconnect(
+              socket,
+            )
+
+            if (restored) {
+              await socket.join(gameId)
+
+              if (restored.player.id && restored.player.id !== socket.id) {
+                io.in(restored.player.id).disconnectSockets(true)
+              }
+
+              socket.emit(EVENTS.PLAYER.SUCCESS_RECONNECT, restored.payload)
+              reply = { joined: true }
+            }
+          }
 
           if (reply === "failed") {
             socket.emit(EVENTS.GAME.ERROR_MESSAGE, "errors:api.serverError")

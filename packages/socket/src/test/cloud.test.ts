@@ -1,11 +1,12 @@
 import { EVENTS } from "@razzia/common/constants"
 import type { SessionResponse } from "@razzia/common/types/auth"
-import type { QuizzMeta } from "@razzia/common/types/game"
 import type {
   ClientToServerEvents,
   ServerToClientEvents,
 } from "@razzia/common/types/game/socket"
 import { STATUS } from "@razzia/common/types/game/status"
+import { applyScoreFixture } from "@razzia/socket/test/score-fixture"
+import { setTimeout as delay } from "node:timers/promises"
 import { Pool } from "pg"
 import { createClient } from "redis"
 import { io, type Socket } from "socket.io-client"
@@ -43,7 +44,7 @@ const nextEvent = (socket: Client, event: keyof ServerToClientEvents) =>
     socket.once(event, (...payload: unknown[]) => resolve(payload.at(0)))
   })
 
-it("shares room admission and rounds between two socket replicas", async ({
+it("persists answers across replicas, waits for B, restores a session and saves tied final results", async ({
   skip,
 }) => {
   if (
@@ -84,11 +85,23 @@ it("shares room admission and rounds between two socket replicas", async ({
         },
       },
     )) as SessionResponse
-    const {
-      quizz: [quiz],
-    } = (await json(CLOUD_TEST_B, "/api/quizz", { token: hostToken })) as {
-      quizz: QuizzMeta[]
-    }
+    const quiz = (await json(CLOUD_TEST_B, "/api/quizz", {
+      token: hostToken,
+      data: {
+        subject: "Week 4 integration",
+        gameMode: "quiz",
+        questions: [
+          {
+            type: "single",
+            question: "One point?",
+            answers: ["Yes", "No"],
+            solutions: [0],
+            cooldown: 3,
+            time: 30,
+          },
+        ],
+      },
+    })) as { id: string }
     const { gameId, inviteCode } = (await json(CLOUD_TEST_A, "/api/games", {
       token: hostToken,
       data: { quizzId: quiz.id },
@@ -97,87 +110,179 @@ it("shares room admission and rounds between two socket replicas", async ({
     const hostReady = nextEvent(host, EVENTS.MANAGER.SUCCESS_RECONNECT)
     host.emit(EVENTS.MANAGER.RECONNECT, { gameId })
     await hostReady
-
     await json(CLOUD_TEST_B, `/api/games/${gameId}/settings`, {
       method: "PATCH",
       token: hostToken,
       data: { answersOnly: true },
     })
-    const { token: playerToken, clientId } = (await json(
-      CLOUD_TEST_B,
-      "/api/auth/session",
-      { data: {} },
-    )) as SessionResponse
-    const { ticket } = (await json(CLOUD_TEST_B, "/api/games/join", {
-      token: playerToken,
-      data: { inviteCode, username: "Cloud Player" },
-    })) as { ticket: string }
-    const player = await connect(CLOUD_TEST_B, playerToken)
-    const joined = nextEvent(player, EVENTS.GAME.SUCCESS_JOIN)
-    const hostSawJoin = nextEvent(host, EVENTS.MANAGER.NEW_PLAYER)
-    player.emit(EVENTS.PLAYER.LOGIN, { ticket })
-    await expect(joined).resolves.toMatchObject({
-      gameId,
-      username: "Cloud Player",
-    })
-    await expect(hostSawJoin).resolves.toMatchObject({ clientId })
 
-    const choose = new Promise((resolve) => {
-      player.on(EVENTS.GAME.STATUS, ({ name, data }) => {
+    const join = async (username: string) => {
+      const session = (await json(CLOUD_TEST_B, "/api/auth/session", {
+        data: {},
+      })) as SessionResponse
+      const { ticket } = (await json(CLOUD_TEST_B, "/api/games/join", {
+        token: session.token,
+        data: { inviteCode, username },
+      })) as { ticket: string }
+      const socket = await connect(CLOUD_TEST_B, session.token)
+      const joined = nextEvent(socket, EVENTS.GAME.SUCCESS_JOIN)
+      socket.emit(EVENTS.PLAYER.LOGIN, { ticket })
+      await joined
+
+      return { socket, session }
+    }
+    const first = await join("First")
+    const second = await join("Second")
+    const choose = new Promise<{ roundId: string }>((resolve) => {
+      first.socket.on(EVENTS.GAME.STATUS, ({ name, data }) => {
         if (name === STATUS.SELECT_ANSWER) {
-          resolve(data)
+          resolve(data as { roundId: string })
         }
       })
     })
     host.emit(EVENTS.MANAGER.START_GAME, { gameId })
-    await expect(choose).resolves.toMatchObject({ answersOnly: true })
+    const { roundId } = await choose
+    expect(roundId).toBeTypeOf("string")
 
-    const {
-      rows: [round],
-    } = await pool.query<{
-      room_status: string
-      username: string
-      round_status: string
-      closes_at: Date
-    }>(
-      `SELECT r.status AS room_status, p.username, s.status AS round_status, s.closes_at
-       FROM rooms r JOIN players p ON p.room_id = r.id
-       JOIN rounds s ON s.room_id = r.id AND s.position = 1
-       WHERE r.id = $1 AND p.id = $2`,
-      [gameId, clientId],
-    )
-    expect(round).toMatchObject({
-      room_status: "running",
-      username: "Cloud Player",
-      round_status: "open",
+    const accepted = nextEvent(first.socket, EVENTS.PLAYER.ANSWER_ACK)
+    first.socket.emit(EVENTS.PLAYER.SELECTED_ANSWER, {
+      gameId,
+      roundId,
+      data: { answerKeys: [0] },
     })
-    expect(round.closes_at).toBeInstanceOf(Date)
-    await expect(redis.hGetAll(`razzia:room:${gameId}`)).resolves.toMatchObject(
-      { phase: "open", position: "1" },
-    )
+    await expect(accepted).resolves.toMatchObject({
+      status: "accepted",
+      answerKeys: [0],
+    })
+    const duplicate = nextEvent(first.socket, EVENTS.PLAYER.ANSWER_ACK)
+    first.socket.emit(EVENTS.PLAYER.SELECTED_ANSWER, {
+      gameId,
+      roundId,
+      data: { answerKeys: [1] },
+    })
+    await expect(duplicate).resolves.toMatchObject({
+      status: "duplicate",
+      answerKeys: [0],
+    })
 
-    const answered = nextEvent(host, EVENTS.GAME.PLAYER_ANSWER)
-    const roundEnded = new Promise((resolve) => {
-      player.on(EVENTS.GAME.STATUS, ({ name, data }) => {
+    first.socket.disconnect()
+    const resumed = await connect(CLOUD_TEST_A, first.session.token)
+    const restored = nextEvent(resumed, EVENTS.PLAYER.SUCCESS_RECONNECT)
+    resumed.emit(EVENTS.PLAYER.RECONNECT, { gameId })
+    await expect(restored).resolves.toMatchObject({
+      status: { name: STATUS.WAIT },
+      acceptedAnswer: { answerKeys: [0] },
+      player: { points: 0 },
+    })
+
+    let resultReceived = false
+    const result = new Promise((resolve) => {
+      resumed.on(EVENTS.GAME.STATUS, ({ name, data }) => {
+        if (name === STATUS.SHOW_RESULT) {
+          resultReceived = true
+          resolve(data)
+        }
+      })
+    })
+    const secondResult = new Promise((resolve) => {
+      second.socket.on(EVENTS.GAME.STATUS, ({ name, data }) => {
         if (name === STATUS.SHOW_RESULT) {
           resolve(data)
         }
       })
     })
-    player.emit(EVENTS.PLAYER.SELECTED_ANSWER, {
+    const secondAccepted = nextEvent(second.socket, EVENTS.PLAYER.ANSWER_ACK)
+    second.socket.emit(EVENTS.PLAYER.SELECTED_ANSWER, {
       gameId,
+      roundId,
       data: { answerKeys: [0] },
     })
-    await expect(answered).resolves.toBe(1)
-    await expect(roundEnded).resolves.toHaveProperty("myPoints")
+    await expect(secondAccepted).resolves.toMatchObject({ status: "accepted" })
+    await expect
+      .poll(async () => {
+        const { rows } = await pool.query<{ status: string }>(
+          "SELECT status FROM rounds WHERE id = $1",
+          [roundId],
+        )
+
+        return rows.at(0)?.status
+      })
+      .toBe("closed")
+    host.emit(EVENTS.MANAGER.ADVANCE, { gameId })
+    await delay(200)
+    expect(resultReceived).toBe(false)
+
+    const update = nextEvent(second.socket, EVENTS.PLAYER.UPDATE_LEADERBOARD)
+    await applyScoreFixture(pool, gameId)
+    await applyScoreFixture(pool, gameId)
+    await redis.publish(
+      "razzia:leaderboard",
+      JSON.stringify({ room_id: gameId }),
+    )
+    await expect(update).resolves.toMatchObject({
+      leaderboard: [
+        { points: 1, rank: 1 },
+        { points: 1, rank: 1 },
+      ],
+    })
+    await expect(result).resolves.toMatchObject({
+      correct: true,
+      myPoints: 1,
+      points: 1,
+      rank: 1,
+    })
+    await expect(secondResult).resolves.toMatchObject({
+      correct: true,
+      myPoints: 1,
+      points: 1,
+      rank: 1,
+    })
+
+    const finished = nextEvent(resumed, EVENTS.GAME.STATUS)
+    await delay(50)
+    host.emit(EVENTS.MANAGER.ADVANCE, { gameId })
+    await expect(finished).resolves.toMatchObject({
+      name: STATUS.FINISHED,
+      data: { rank: 1 },
+    })
+    await expect(redis.hGet(`razzia:room:${gameId}`, "phase")).resolves.toBe(
+      "finished",
+    )
+    const { results } = (await json(CLOUD_TEST_B, "/api/results", {
+      token: hostToken,
+    })) as { results: Array<{ id: string; subject: string }> }
+    const saved = results.find(
+      (entry) => entry.subject === "Week 4 integration",
+    )
+    expect(saved).toBeDefined()
+    const report = await json(CLOUD_TEST_B, `/api/results/${saved?.id}`, {
+      token: hostToken,
+    })
+    expect(report).toMatchObject({
+      players: [
+        { points: 1, rank: 1 },
+        { points: 1, rank: 1 },
+      ],
+    })
     const {
-      rows: [closed],
-    } = await pool.query<{ status: string }>(
-      "SELECT status FROM rounds WHERE room_id = $1 AND position = 1",
+      rows: [counts],
+    } = await pool.query<{ answers: number; events: number }>(
+      `SELECT (SELECT count(*)::integer FROM answers WHERE room_id = $1) AS answers,
+
+        (SELECT count(*)::integer FROM outbox o JOIN answers a USING (round_id, player_id) WHERE a.room_id = $1) AS events`,
       [gameId],
     )
-
-    expect(closed.status).toBe("closed")
+    expect(counts).toEqual({ answers: 2, events: 2 })
+    await redis.del(`razzia:room:${gameId}`)
+    second.socket.disconnect()
+    const databaseOnly = await connect(CLOUD_TEST_B, second.session.token)
+    const recovered = nextEvent(databaseOnly, EVENTS.PLAYER.SUCCESS_RECONNECT)
+    databaseOnly.emit(EVENTS.PLAYER.RECONNECT, { gameId })
+    await expect(recovered).resolves.toMatchObject({
+      player: { points: 1 },
+      status: { name: STATUS.FINISHED, data: { rank: 1 } },
+      acceptedAnswer: { answerKeys: [0] },
+    })
   } finally {
     for (const socket of sockets) {
       socket.disconnect()
@@ -189,4 +294,4 @@ it("shares room admission and rounds between two socket replicas", async ({
 
     await pool.end()
   }
-}, 25000)
+}, 30000)

@@ -13,6 +13,7 @@ import {
 } from "@razzia/common/types/game/status"
 import type { GameSocket } from "@razzia/socket/handlers/types"
 import { cloud } from "@razzia/socket/services/cloud"
+import { CloudGame } from "@razzia/socket/services/cloud-game"
 import { saveResult } from "@razzia/socket/services/config"
 import { CooldownTimer } from "@razzia/socket/services/game/cooldown-timer"
 import { PlayerManager } from "@razzia/socket/services/game/player-manager"
@@ -45,6 +46,7 @@ class Game {
   private readonly playerManager: PlayerManager
   private readonly round: RoundManager
   private readonly cooldown: CooldownTimer
+  private readonly persistence?: CloudGame
   private managerGraceTimer: NodeJS.Timeout | null = null
 
   private lastBroadcastStatus: {
@@ -82,6 +84,7 @@ class Game {
     })
 
     const storage = cloud
+    this.persistence = storage && new CloudGame(storage, this.gameId)
     this.round = new RoundManager({
       quizz,
       players: this.playerManager,
@@ -95,7 +98,11 @@ class Game {
         this.playerStatus.clear()
         this.managerStatus = null
       },
-      onGameFinished: saveResult,
+      onGameFinished: (result) =>
+        this.persistence
+          ? this.persistence.saveReport(result)
+          : saveResult(result),
+      persistence: this.persistence,
       savePhase:
         storage &&
         (async (phase, position, closesAt) => {
@@ -166,7 +173,17 @@ class Game {
   private broadcastStatus<T extends Status>(status: T, data: StatusDataMap[T]) {
     const statusData = { name: status, data }
     this.lastBroadcastStatus = statusData
-    this.io.to(this.gameId).emit(EVENTS.GAME.STATUS, statusData)
+    const emit = () => {
+      this.io.to(this.gameId).emit(EVENTS.GAME.STATUS, statusData)
+    }
+
+    if (this.persistence) {
+      return this.persistence
+        .broadcast(statusData, this.round.position)
+        .then(emit)
+    }
+
+    emit()
   }
 
   private sendStatus<T extends Status>(
@@ -182,7 +199,18 @@ class Game {
       this.playerStatus.set(target, statusData)
     }
 
-    this.io.to(target).emit(EVENTS.GAME.STATUS, statusData)
+    const emit = () => {
+      this.io.to(target).emit(EVENTS.GAME.STATUS, statusData)
+    }
+    const player = this.playerManager.findById(target)
+
+    if (this.persistence && player) {
+      return this.persistence
+        .playerState(player.clientId, statusData, this.round.position)
+        .then(emit)
+    }
+
+    emit()
   }
 
   // Player actions
@@ -257,7 +285,7 @@ class Game {
       return
     }
 
-    this.reconnectPlayer(socket)
+    return this.reconnectPlayer(socket)
   }
 
   private reconnectManager(socket: GameSocket) {
@@ -309,6 +337,10 @@ class Game {
   }
 
   private reconnectPlayer(socket: GameSocket) {
+    if (this.persistence) {
+      return this.reconnectCloudPlayer(socket, this.persistence)
+    }
+
     const clientId = getClientId(socket)
     const player = this.playerManager.findByClientId(clientId)
 
@@ -356,6 +388,45 @@ class Game {
     )
   }
 
+  private async reconnectCloudPlayer(
+    socket: GameSocket,
+    persistence: CloudGame,
+  ) {
+    const restored = await persistence.reconnect(socket)
+
+    if (!restored) {
+      socket.emit(EVENTS.GAME.RESET, "errors:game.notFound")
+
+      return
+    }
+
+    const { player, payload } = restored
+    const existing = this.playerManager.findByClientId(player.clientId)
+    const oldId = existing?.id ?? player.id
+    const previousStatus = this.playerStatus.get(oldId)
+    this.playerStatus.delete(oldId)
+
+    if (previousStatus) {
+      this.playerStatus.set(socket.id, previousStatus)
+    }
+
+    const replacement = { ...player, id: socket.id, connected: true }
+    this.playerManager.replace([
+      ...this.players.filter((entry) => entry.clientId !== player.clientId),
+      replacement,
+    ])
+    this.round.updatePlayerId(oldId, socket.id)
+    await socket.join(this.gameId)
+
+    if (oldId && oldId !== socket.id) {
+      this.io.in(oldId).disconnectSockets(true)
+    }
+
+    socket.emit(EVENTS.PLAYER.SUCCESS_RECONNECT, payload)
+    this.notifyPlayerUpdated(oldId, replacement)
+    this.playerManager.broadcastCount()
+  }
+
   // Disconnect helpers
 
   setManagerDisconnected() {
@@ -383,6 +454,8 @@ class Game {
     if (player) {
       this.notifyPlayerUpdated(socketId, player, timedOut)
     }
+
+    return this.persistence?.disconnect(socketId)
   }
 
   private notifyPlayerUpdated(
@@ -417,8 +490,8 @@ class Game {
     }
   }
 
-  selectAnswer(socket: GameSocket, answerIds: number[]) {
-    this.round.selectAnswer(socket, answerIds)
+  selectAnswer(socket: GameSocket, answerIds: number[], roundId?: string) {
+    return this.round.selectAnswer(socket, answerIds, roundId)
   }
 
   advance() {

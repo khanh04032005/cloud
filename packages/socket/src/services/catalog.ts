@@ -36,7 +36,7 @@ export const importFileQuizzes = async () => {
     const quizzes = new Map(
       files
         .getQuizz()
-        .toReversed()
+        .reverse()
         .map((quiz) => [quiz.id, quiz]),
     )
     await client.query(

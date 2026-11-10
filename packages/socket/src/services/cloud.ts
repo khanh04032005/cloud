@@ -44,7 +44,7 @@ export class Cloud {
   }
 
   async connect() {
-    await this.pool.query("SELECT locked FROM rooms LIMIT 0")
+    await this.pool.query("SELECT runtime, game_mode FROM rooms LIMIT 0")
     await Promise.all([this.redis.connect(), this.subscriber.connect()])
   }
 
@@ -103,8 +103,8 @@ export class Cloud {
     try {
       const created = await this.transaction(async (client) => {
         const room = await client.query(
-          `INSERT INTO rooms (id, invite_code, host_client_id, quiz_id, subject, settings)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO rooms (id, invite_code, host_client_id, quiz_id, subject, settings, game_mode)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            ON CONFLICT (invite_code) WHERE status IN ('lobby', 'running') DO NOTHING`,
           [
             game.gameId,
@@ -113,6 +113,7 @@ export class Cloud {
             quiz.id,
             quiz.subject,
             game.settings,
+            quiz.gameMode,
           ],
         )
 
@@ -152,7 +153,7 @@ export class Cloud {
     const { rows } = await this.pool.query<RoomAdmission>(
       `SELECT r.id AS "gameId", r.host_client_id AS "hostClientId", r.locked,
               r.settings, p.username
-       FROM rooms AS r LEFT JOIN players AS p ON p.room_id = r.id AND p.id = $2
+       FROM rooms AS r LEFT JOIN players AS p ON p.room_id = r.id AND p.id = $2 AND p.active
        WHERE r.invite_code = $1 AND r.status IN ('lobby', 'running')`,
       [inviteCode, clientId ?? null],
     )
@@ -181,16 +182,16 @@ export class Cloud {
 
   async prunePlayers(game: Game) {
     await this.pool.query(
-      "DELETE FROM players WHERE room_id = $1 AND NOT (id = ANY($2::uuid[]))",
+      "UPDATE players SET active = false, connected = false WHERE room_id = $1 AND NOT (id = ANY($2::uuid[]))",
       [game.gameId, game.players.map(({ clientId }) => clientId)],
     )
   }
 
   async savePlayer(gameId: string, player: Player) {
     await this.pool.query(
-      `INSERT INTO players (room_id, id, username) VALUES ($1, $2, $3)
-       ON CONFLICT (room_id, id) DO UPDATE SET username = EXCLUDED.username`,
-      [gameId, player.clientId, player.username],
+      `INSERT INTO players (room_id, id, username, socket_id, connected) VALUES ($1, $2, $3, $4, true)
+       ON CONFLICT (room_id, id) DO UPDATE SET username = EXCLUDED.username, socket_id = EXCLUDED.socket_id, connected = true, active = true`,
+      [gameId, player.clientId, player.username, player.id],
     )
   }
 
@@ -206,8 +207,8 @@ export class Cloud {
     const changed =
       phase === "running" || phase === "finished"
         ? await this.pool.query(
-            `UPDATE rooms SET status = $2, finished_at = CASE WHEN $2 = 'finished' THEN now() ELSE NULL END
-           WHERE id = $1 AND status IN ('lobby', 'running')`,
+            `UPDATE rooms SET status = $2, finished_at = CASE WHEN $2 = 'finished' THEN COALESCE(finished_at, now()) ELSE NULL END
+           WHERE id = $1 AND (status IN ('lobby', 'running') OR (status = 'finished' AND $2 = 'finished'))`,
             [gameId, phase],
           )
         : await this.pool.query(
