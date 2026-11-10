@@ -7,6 +7,14 @@ import type {
 import { databaseUrl, redisUrl } from "@razzia/socket/env"
 import type Game from "@razzia/socket/services/game"
 import { randomUUID } from "node:crypto"
+import {
+  acquireLocked,
+  releaseLease,
+  roomKey,
+  withLease,
+  type RoomLease,
+} from "@razzia/socket/services/leases"
+import { metrics } from "@razzia/socket/services/metrics"
 import { Pool, type PoolClient } from "pg"
 import { createClient } from "redis"
 
@@ -17,8 +25,6 @@ export interface RoomAdmission {
   settings: GameSettings
   username: string | null
 }
-
-const roomKey = (gameId: string) => `razzia:room:${gameId}`
 
 export class Cloud {
   readonly nodeId = randomUUID()
@@ -44,7 +50,7 @@ export class Cloud {
   }
 
   async connect() {
-    await this.pool.query("SELECT runtime, game_mode FROM rooms LIMIT 0")
+    await this.pool.query("SELECT owner_token, lease_until FROM rooms LIMIT 0")
     await Promise.all([this.redis.connect(), this.subscriber.connect()])
   }
 
@@ -92,58 +98,50 @@ export class Cloud {
   }
 
   async createRoom(game: Game, quiz: QuizzWithId): Promise<boolean> {
-    // Publish the route before the room becomes visible to other replicas in SQL.
-    const key = roomKey(game.gameId)
-    await this.redis.hSet(key, {
-      owner: this.nodeId,
-      phase: "lobby",
-      position: "0",
+    const created = await this.transaction(async (client) => {
+      const room = await client.query(
+        `INSERT INTO rooms (id, invite_code, host_client_id, quiz_id, subject, settings, game_mode)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (invite_code) WHERE status IN ('lobby', 'running') DO NOTHING`,
+        [
+          game.gameId,
+          game.inviteCode,
+          game.manager.clientId,
+          quiz.id,
+          quiz.subject,
+          game.settings,
+          quiz.gameMode,
+        ],
+      )
+
+      if (room.rowCount === 0) {
+        return undefined
+      }
+
+      await client.query(
+        `INSERT INTO rounds (room_id, question_id, position, question_snapshot)
+         SELECT $1, q.id, entry.position, entry.definition
+         FROM jsonb_array_elements($3::jsonb) WITH ORDINALITY AS entry(definition, position)
+         LEFT JOIN questions q ON q.quiz_id = $2 AND q.position = entry.position AND q.definition = entry.definition`,
+        [game.gameId, quiz.id, JSON.stringify(quiz.questions)],
+      )
+      const lease = await acquireLocked(this, game.gameId, client)
+
+      if (!lease) {
+        throw new Error("Could not acquire newly created room")
+      }
+
+      return lease
     })
 
-    try {
-      const created = await this.transaction(async (client) => {
-        const room = await client.query(
-          `INSERT INTO rooms (id, invite_code, host_client_id, quiz_id, subject, settings, game_mode)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           ON CONFLICT (invite_code) WHERE status IN ('lobby', 'running') DO NOTHING`,
-          [
-            game.gameId,
-            game.inviteCode,
-            game.manager.clientId,
-            quiz.id,
-            quiz.subject,
-            game.settings,
-            quiz.gameMode,
-          ],
-        )
-
-        if (room.rowCount === 0) {
-          return false
-        }
-
-        await client.query(
-          `INSERT INTO rounds (room_id, question_id, position, question_snapshot)
-           SELECT $1, q.id, entry.position, entry.definition
-           FROM jsonb_array_elements($3::jsonb) WITH ORDINALITY AS entry(definition, position)
-           LEFT JOIN questions AS q ON q.quiz_id = $2 AND q.position = entry.position
-             AND q.definition = entry.definition`,
-          [game.gameId, quiz.id, JSON.stringify(quiz.questions)],
-        )
-
-        return true
-      })
-
-      if (created) {
-        return true
-      }
-    } catch (error) {
-      await this.redis.del(key).catch(console.error)
-      throw error
+    if (!created) {
+      return false
     }
 
-    await this.redis.del(key)
+    game.attachLease(created)
+    metrics.increment("leases_acquired")
 
-    return false
+    return true
   }
 
   async findRoom(
@@ -159,7 +157,7 @@ export class Cloud {
     )
     const room = rows.at(0)
 
-    if (!room || !(await this.owner(room.gameId))) {
+    if (!room) {
       return undefined
     }
 
@@ -174,24 +172,30 @@ export class Cloud {
   }
 
   async saveLobby(game: Game) {
-    await this.pool.query(
-      "UPDATE rooms SET settings = $2, locked = $3 WHERE id = $1",
-      [game.gameId, game.settings, game.locked],
+    await withLease(this, game.lease, (client) =>
+      client.query(
+        "UPDATE rooms SET settings = $2, locked = $3 WHERE id = $1",
+        [game.gameId, game.settings, game.locked],
+      ),
     )
   }
 
   async prunePlayers(game: Game) {
-    await this.pool.query(
-      "UPDATE players SET active = false, connected = false WHERE room_id = $1 AND NOT (id = ANY($2::uuid[]))",
-      [game.gameId, game.players.map(({ clientId }) => clientId)],
+    await withLease(this, game.lease, (client) =>
+      client.query(
+        "UPDATE players SET active = false, connected = false WHERE room_id = $1 AND NOT (id = ANY($2::uuid[]))",
+        [game.gameId, game.players.map(({ clientId }) => clientId)],
+      ),
     )
   }
 
-  async savePlayer(gameId: string, player: Player) {
-    await this.pool.query(
-      `INSERT INTO players (room_id, id, username, socket_id, connected) VALUES ($1, $2, $3, $4, true)
+  async savePlayer(gameId: string, player: Player, lease?: RoomLease) {
+    await withLease(this, lease, (client) =>
+      client.query(
+        `INSERT INTO players (room_id, id, username, socket_id, connected) VALUES ($1, $2, $3, $4, true)
        ON CONFLICT (room_id, id) DO UPDATE SET username = EXCLUDED.username, socket_id = EXCLUDED.socket_id, connected = true, active = true`,
-      [gameId, player.clientId, player.username, player.id],
+        [gameId, player.clientId, player.username, player.id],
+      ),
     )
   }
 
@@ -202,46 +206,69 @@ export class Cloud {
       position?: number
       closesAt?: Date | null
     },
+    lease?: RoomLease,
   ) {
     const { phase, position = 0, closesAt = null } = state
-    const changed =
-      phase === "running" || phase === "finished"
-        ? await this.pool.query(
-            `UPDATE rooms SET status = $2, finished_at = CASE WHEN $2 = 'finished' THEN COALESCE(finished_at, now()) ELSE NULL END
+    const changed = await withLease(this, lease, (client) => {
+      if (phase === "running" || phase === "finished") {
+        return client.query(
+          `UPDATE rooms SET status = $2, finished_at = CASE WHEN $2 = 'finished' THEN COALESCE(finished_at, now()) ELSE NULL END
            WHERE id = $1 AND (status IN ('lobby', 'running') OR (status = 'finished' AND $2 = 'finished'))`,
-            [gameId, phase],
-          )
-        : await this.pool.query(
-            `WITH active_room AS (SELECT id FROM rooms WHERE id = $1 AND status = 'running' FOR UPDATE)
-           UPDATE rounds SET status = $3, closes_at = COALESCE($4, closes_at)
-           FROM active_room WHERE room_id = active_room.id AND position = $2`,
-            [gameId, position, phase, closesAt],
-          )
+          [gameId, phase],
+        )
+      }
+
+      return client.query(
+        `UPDATE rounds SET status = $3, closes_at = COALESCE($4, closes_at),
+           closed_at = CASE WHEN $3 = 'closed' THEN clock_timestamp() ELSE closed_at END
+         WHERE room_id = $1 AND position = $2 AND status = $5
+           AND EXISTS (SELECT 1 FROM rooms WHERE id = $1 AND status = 'running')`,
+        [
+          gameId,
+          position,
+          phase,
+          closesAt,
+
+          phase === "open" ? "pending" : "open",
+        ],
+      )
+    })
 
     if (!changed.rowCount) {
-      return
+      return false
+    }
+
+    if (phase === "closed") {
+      metrics.increment("rounds_closed")
     }
 
     await this.redis.eval(
-      `if redis.call('HGET', KEYS[1], 'owner') == ARGV[1] then
-         return redis.call('HSET', KEYS[1], 'phase', ARGV[2], 'position', ARGV[3])
-       end`,
+      `if redis.call('GET', KEYS[1]) == ARGV[1] then
+         return redis.call('HSET', KEYS[2], 'phase', ARGV[2], 'position', ARGV[3])
+       end return 0`,
       {
-        keys: [roomKey(gameId)],
-        arguments: [this.nodeId, phase, String(position)],
+        keys: [`razzia:lease:${gameId}`, roomKey(gameId)],
+        arguments: [lease?.token ?? "", phase, String(position)],
       },
     )
+
+    return true
   }
 
-  async removeRoom(gameId: string) {
-    await this.pool.query(
-      `WITH cancelled AS (
+  async removeRoom(gameId: string, lease?: RoomLease) {
+    await withLease(this, lease, (client) =>
+      client.query(
+        `WITH cancelled AS (
          UPDATE rooms SET status = 'cancelled' WHERE id = $1 AND status IN ('lobby', 'running') RETURNING id
-       ) UPDATE rounds SET status = 'closed'
+       ) UPDATE rounds SET status = 'closed', closed_at = COALESCE(closed_at, clock_timestamp())
          FROM cancelled WHERE room_id = cancelled.id AND status = 'open'`,
-      [gameId],
+        [gameId],
+      ),
     )
-    await this.redis.del(roomKey(gameId))
+
+    if (lease) {
+      await releaseLease(this, lease)
+    }
   }
 }
 

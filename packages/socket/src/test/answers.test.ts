@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, expect, it } from "vitest"
 import { Cloud } from "@razzia/socket/services/cloud"
+import {
+  acquireLease,
+  renewLease,
+  releaseLease,
+  withLease,
+} from "@razzia/socket/services/leases"
 import { CloudGame } from "@razzia/socket/services/cloud-game"
 import { applyScoreFixture } from "@razzia/socket/test/score-fixture"
 import type { GameSocket } from "@razzia/socket/handlers/types"
@@ -92,9 +98,25 @@ const fixture = async () => {
   })
   rooms.push(roomId)
   const game = new CloudGame(storage, roomId)
+  const lease = await acquireLease(storage, roomId)
+
+  if (!lease) {
+    throw new Error("Fixture lease was not acquired")
+  }
+
+  game.attachLease(lease)
   const submission = { playerId, socketId, roundId, position: 1, keys: [0] }
 
-  return { storage, game, roomId, roundId, playerId, socketId, submission }
+  return {
+    storage,
+    game,
+    lease,
+    roomId,
+    roundId,
+    playerId,
+    socketId,
+    submission,
+  }
 }
 
 it.skipIf(!enabled)(
@@ -261,5 +283,43 @@ it.skipIf(!enabled)(
     })
     const scores = await game.scores(1)
     expect(scores).toMatchObject([{ points: 1, rank: 1 }])
+  },
+)
+
+it.skipIf(!enabled)(
+  "fences stale owners and preserves the successor lease on late renewal and release",
+  async () => {
+    const { storage: db, game, lease, roomId, submission } = await fixture()
+    expect(await acquireLease(db, roomId)).toBeUndefined()
+    await db.pool.query(
+      "UPDATE rooms SET lease_until = '-infinity' WHERE id = $1",
+      [roomId],
+    )
+    await db.redis.del(`razzia:lease:${roomId}`)
+    const successor = await acquireLease(db, roomId)
+    expect(successor?.epoch).toBe(lease.epoch + 1)
+
+    if (!successor) {
+      throw new Error("Successor missing")
+    }
+
+    await expect(game.accept(submission)).rejects.toThrow("Room lease lost")
+    await expect(renewLease(db, lease)).rejects.toThrow("Room lease lost")
+    await expect(
+      db.phase(roomId, { phase: "closed", position: 1 }, lease),
+    ).rejects.toThrow("Room lease lost")
+    await releaseLease(db, lease)
+    expect(await db.redis.get(`razzia:lease:${roomId}`)).toBe(successor.token)
+    await expect(
+      withLease(db, successor, async (client) => {
+        const { rows } = await client.query(
+          "SELECT id FROM rooms WHERE id = $1",
+          [roomId],
+        )
+
+        return rows.length
+      }),
+    ).resolves.toBe(1)
+    await releaseLease(db, successor)
   },
 )

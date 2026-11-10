@@ -21,6 +21,10 @@ const envSchema = z
     ),
     DATABASE_URL: optional(z.url()),
     REDIS_URL: optional(z.url()),
+    ROOM_LEASE_TTL_MS: z.preprocess(
+      (value) => (value === "" ? undefined : value),
+      z.coerce.number().int().min(1000).default(9000),
+    ),
     GAME_SPEED: z.preprocess(
       (value) => (value === "" ? undefined : value),
       z.coerce
@@ -53,6 +57,8 @@ export const gameSpeed = parsed.data.GAME_SPEED
 export const databaseUrl = parsed.data.DATABASE_URL
 
 export const redisUrl = parsed.data.REDIS_URL
+
+export const roomLeaseTtlMs = parsed.data.ROOM_LEASE_TTL_MS
 
 export const jwtSecret =
   parsed.data.JWT_SECRET ?? randomBytes(32).toString("hex")

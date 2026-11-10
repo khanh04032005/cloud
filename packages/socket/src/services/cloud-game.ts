@@ -14,16 +14,18 @@ import {
 } from "@razzia/common/types/game/status"
 import type { GameSocket } from "@razzia/socket/handlers/types"
 import type { Cloud } from "@razzia/socket/services/cloud"
+import { withLease, type RoomLease } from "@razzia/socket/services/leases"
 import { QUESTION_SCORING } from "@razzia/socket/services/scoring"
 import type { ScoredPlayer } from "@razzia/socket/services/scoring/round"
 import { SECOND_MS } from "@razzia/socket/utils/sleep"
 import { setTimeout as delay } from "node:timers/promises"
 import type { PoolClient } from "pg"
 
-interface GameState {
+export interface GameState {
   name: Status
   data: StatusDataMap[Status]
 }
+
 type Receipt = Parameters<
   ServerToClientEvents[typeof EVENTS.PLAYER.ANSWER_ACK]
 >[0]
@@ -92,10 +94,19 @@ export class CloudGame {
   private writes = Promise.resolve()
   readonly storage: Cloud
   readonly gameId: string
+  private lease?: RoomLease
 
   constructor(storage: Cloud, gameId: string) {
     this.storage = storage
     this.gameId = gameId
+  }
+
+  attachLease(lease: RoomLease) {
+    this.lease = lease
+  }
+
+  private transaction<T>(run: (_client: PoolClient) => Promise<T>) {
+    return withLease(this.storage, this.lease, run)
   }
 
   private write(run: () => Promise<void>) {
@@ -105,22 +116,46 @@ export class CloudGame {
     return next
   }
 
-  broadcast(state: GameState, position: number) {
+  broadcast(state: GameState, position: number, deadline: Date | null = null) {
     return this.write(async () => {
-      await this.storage.pool.query(
-        "UPDATE rooms SET runtime = $2, current_position = $3 WHERE id = $1",
-        [this.gameId, state, position],
+      await this.transaction((client) =>
+        client.query(
+          "UPDATE rooms SET runtime = $2, current_position = $3, stage_deadline = $4, host_state = CASE WHEN current_position <> $3 THEN NULL ELSE host_state END WHERE id = $1",
+          [this.gameId, state, position, deadline],
+        ),
       )
     })
   }
 
   playerState(clientId: string, state: GameState, position: number) {
     return this.write(async () => {
-      await this.storage.pool.query(
-        "UPDATE players SET state = $3, state_position = $4 WHERE room_id = $1 AND id = $2",
-        [this.gameId, clientId, state, position],
+      await this.transaction((client) =>
+        client.query(
+          "UPDATE players SET state = $3, state_position = $4 WHERE room_id = $1 AND id = $2",
+          [this.gameId, clientId, state, position],
+        ),
       )
     })
+  }
+
+  managerState(state: GameState, position: number, autoAdvanceAt: Date | null) {
+    return this.write(async () => {
+      await this.transaction((client) =>
+        client.query(
+          "UPDATE rooms SET host_state = $2, host_state_position = $3, auto_advance_at = $4 WHERE id = $1",
+          [this.gameId, state, position, autoAdvanceAt],
+        ),
+      )
+    })
+  }
+
+  async managerConnection(socketId: string, connected: boolean) {
+    await this.transaction((client) =>
+      client.query(
+        "UPDATE rooms SET manager_socket_id = $2, manager_connected = $3 WHERE id = $1",
+        [this.gameId, socketId, connected],
+      ),
+    )
   }
 
   async roundId(position: number) {
@@ -139,7 +174,7 @@ export class CloudGame {
     roundId?: string
     keys: number[]
   }): Promise<Receipt> {
-    return this.storage.transaction(async (client) => {
+    return this.transaction(async (client) => {
       const { rows: rooms } = await client.query<{
         status: string
         current_position: number
@@ -309,7 +344,7 @@ export class CloudGame {
     const { rows } = await this.storage.pool.query<
       ScoredPlayer & { active: boolean; answer_keys: number[] | null }
     >(
-      `SELECT p.socket_id AS id, p.id AS "clientId", p.username, p.connected, p.active,
+      `SELECT COALESCE(NULLIF(p.socket_id, ''), 'offline:' || p.id::text) AS id, p.id AS "clientId", p.username, p.connected, p.active,
          COALESCE(s.points, 0) AS points, 0 AS streak,
          rank() OVER (ORDER BY COALESCE(s.points, 0) DESC)::integer AS rank,
          COALESCE(a.is_correct, false) AS "lastCorrect",
@@ -434,7 +469,7 @@ export class CloudGame {
   }
 
   async saveReport(report: GameResult) {
-    await this.storage.transaction(async (client) => {
+    await this.transaction(async (client) => {
       const { rows: inconsistent } = await client.query<{ id: string }>(
         `SELECT p.id FROM players p LEFT JOIN results r ON r.room_id = p.room_id AND r.player_id = p.id
          LEFT JOIN answers a ON a.room_id = p.room_id AND a.player_id = p.id WHERE p.room_id = $1

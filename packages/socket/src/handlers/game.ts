@@ -9,6 +9,8 @@ import type { GameSocket, SocketContext } from "@razzia/socket/handlers/types"
 import { verifyJoinTicket } from "@razzia/socket/services/auth"
 import { cloud } from "@razzia/socket/services/cloud"
 import { CloudGame } from "@razzia/socket/services/cloud-game"
+import { ensureRoom } from "@razzia/socket/services/coordinator"
+import { metrics } from "@razzia/socket/services/metrics"
 import Game from "@razzia/socket/services/game"
 import { getIo } from "@razzia/socket/services/io"
 import Registry from "@razzia/socket/services/registry"
@@ -52,8 +54,8 @@ const bindGameHandlers = (io: Server, socket: GameSocket, on: Register) => {
     registry.removeGame(game.gameId)
   }
 
-  const handleManagerLeave = (game: Game) => {
-    game.setManagerDisconnected()
+  const handleManagerLeave = async (game: Game) => {
+    await game.setManagerDisconnected()
     registry.markGameAsEmpty(game)
 
     if (!game.started) {
@@ -61,8 +63,8 @@ const bindGameHandlers = (io: Server, socket: GameSocket, on: Register) => {
     }
   }
 
-  const handleManagerDisconnect = (game: Game) => {
-    game.setManagerDisconnected()
+  const handleManagerDisconnect = async (game: Game) => {
+    await game.setManagerDisconnected()
     registry.markGameAsEmpty(game)
 
     if (!game.started) {
@@ -157,7 +159,8 @@ const bindGameHandlers = (io: Server, socket: GameSocket, on: Register) => {
 
     if (game) {
       console.log(`Manager left game ${game.inviteCode}`)
-      handleManagerLeave(game)
+
+      return handleManagerLeave(game)
     }
   })
 
@@ -178,9 +181,8 @@ const bindGameHandlers = (io: Server, socket: GameSocket, on: Register) => {
 
     if (managerGame?.manager.id === socket.id) {
       console.log(`Manager disconnected from game ${managerGame.inviteCode}`)
-      handleManagerDisconnect(managerGame)
 
-      return
+      return handleManagerDisconnect(managerGame)
     }
 
     const playerGame = gameId
@@ -231,6 +233,8 @@ const runCommand = (io: Server, command: Command, localSocket?: GameSocket) => {
       if (!game) {
         return "missing"
       }
+
+      await game.assertOwner()
 
       if (command.event === "settings") {
         if (game.manager.clientId !== command.clientId) {
@@ -305,7 +309,12 @@ const routeCommand = async (
   command: Command,
   socket?: GameSocket,
 ): Promise<Reply> => {
-  const owner = await cloud?.owner(command.gameId)
+  let owner = await cloud?.owner(command.gameId)
+
+  if (!owner || owner === cloud?.nodeId) {
+    await ensureRoom(command.gameId)
+    owner = await cloud?.owner(command.gameId)
+  }
 
   if (!owner) {
     return "missing"
@@ -331,7 +340,13 @@ export const installRoomRouting = (io: Server) => {
       if (owner !== cloud?.nodeId) {
         ack(null)
       } else {
-        void runCommand(io, command).then(ack)
+        void ensureRoom(command.gameId)
+          .then(() => runCommand(io, command))
+          .then(ack)
+          .catch((error: unknown) => {
+            console.error("Room recovery failed:", error)
+            ack("failed")
+          })
       }
     },
   )
@@ -380,61 +395,72 @@ export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
     register(
       event,
       (...args: Parameters<ClientToServerEvents[typeof event]>) => {
+        const receivedAt = performance.now()
         enqueue(async () => {
-          const [message] = args
-          const gameId =
-            "ticket" in message
-              ? (await checkJoinTicket(message.ticket, socket))?.gameId
-              : message.gameId
+          try {
+            const [message] = args
+            const gameId =
+              "ticket" in message
+                ? (await checkJoinTicket(message.ticket, socket))?.gameId
+                : message.gameId
 
-          if (!gameId) {
-            return
-          }
+            if (!gameId) {
+              return
+            }
 
-          let reply = await routeSocketCommand(
-            io,
-            { gameId, event, args, socketId: socket.id, data: socket.data },
-            socket,
-          )
-
-          if (reply === "missing" && event === EVENTS.PLAYER.RECONNECT) {
-            const restored = await new CloudGame(storage, gameId).reconnect(
+            let reply = await routeSocketCommand(
+              io,
+              { gameId, event, args, socketId: socket.id, data: socket.data },
               socket,
             )
 
-            if (restored) {
-              await socket.join(gameId)
+            if (reply === "missing" && event === EVENTS.PLAYER.RECONNECT) {
+              const restored = await new CloudGame(storage, gameId).reconnect(
+                socket,
+              )
 
-              if (restored.player.id && restored.player.id !== socket.id) {
-                io.in(restored.player.id).disconnectSockets(true)
+              if (restored) {
+                await socket.join(gameId)
+
+                if (restored.player.id && restored.player.id !== socket.id) {
+                  io.in(restored.player.id).disconnectSockets(true)
+                }
+
+                socket.emit(EVENTS.PLAYER.SUCCESS_RECONNECT, restored.payload)
+                reply = { joined: true }
               }
-
-              socket.emit(EVENTS.PLAYER.SUCCESS_RECONNECT, restored.payload)
-              reply = { joined: true }
             }
-          }
 
-          if (reply === "failed") {
-            socket.emit(EVENTS.GAME.ERROR_MESSAGE, "errors:api.serverError")
-          }
+            if (reply === "failed") {
+              socket.emit(EVENTS.GAME.ERROR_MESSAGE, "errors:api.serverError")
+            }
 
-          if (reply === "missing") {
-            if (event === EVENTS.MANAGER.RECONNECT) {
-              socket.emit(EVENTS.GAME.RESET, "errors:game.expired")
-            } else if (
-              event === EVENTS.PLAYER.RECONNECT ||
-              event === EVENTS.PLAYER.LOGIN
+            if (reply === "missing") {
+              if (event === EVENTS.MANAGER.RECONNECT) {
+                socket.emit(EVENTS.GAME.RESET, "errors:game.expired")
+              } else if (
+                event === EVENTS.PLAYER.RECONNECT ||
+                event === EVENTS.PLAYER.LOGIN
+              ) {
+                socket.emit(EVENTS.GAME.RESET, "errors:game.notFound")
+              } else {
+                socket.emit(EVENTS.GAME.ERROR_MESSAGE, "errors:game.notFound")
+              }
+            }
+
+            if (
+              typeof reply === "object" &&
+              "joined" in reply &&
+              reply.joined
             ) {
-              socket.emit(EVENTS.GAME.RESET, "errors:game.notFound")
+              rooms.add(gameId)
             } else {
-              socket.emit(EVENTS.GAME.ERROR_MESSAGE, "errors:game.notFound")
+              rooms.delete(gameId)
             }
-          }
-
-          if (typeof reply === "object" && "joined" in reply && reply.joined) {
-            rooms.add(gameId)
-          } else {
-            rooms.delete(gameId)
+          } finally {
+            if (event === EVENTS.PLAYER.SELECTED_ANSWER) {
+              metrics.observeAck((performance.now() - receivedAt) / 1000)
+            }
           }
         })
       },

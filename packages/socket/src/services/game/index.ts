@@ -18,6 +18,12 @@ import { saveResult } from "@razzia/socket/services/config"
 import { CooldownTimer } from "@razzia/socket/services/game/cooldown-timer"
 import { PlayerManager } from "@razzia/socket/services/game/player-manager"
 import { RoundManager } from "@razzia/socket/services/game/round-manager"
+import type { RecoveredRoom } from "@razzia/socket/services/game/recovery-state"
+import {
+  LeaseLost,
+  withLease,
+  type RoomLease,
+} from "@razzia/socket/services/leases"
 import Registry from "@razzia/socket/services/registry"
 import { createInviteCode } from "@razzia/socket/utils/game"
 import { createNickname } from "@razzia/socket/utils/nickname"
@@ -47,6 +53,7 @@ class Game {
   private readonly round: RoundManager
   private readonly cooldown: CooldownTimer
   private readonly persistence?: CloudGame
+  private _lease?: RoomLease
   private managerGraceTimer: NodeJS.Timeout | null = null
 
   private lastBroadcastStatus: {
@@ -62,18 +69,25 @@ class Game {
     { name: Status; data: StatusDataMap[Status] }
   >()
 
-  constructor(io: Server, managerClientId: string, quizz: Quizz) {
+  constructor(
+    io: Server,
+    managerClientId: string,
+    input: Quizz | RecoveredRoom,
+  ) {
+    const recovered = "quiz" in input ? input : undefined
+    const quizz = recovered ? recovered.quiz : (input as Quizz)
     this.io = io
-    this.gameId = uuid()
-    this.inviteCode = createInviteCode()
+    this.gameId = recovered?.id ?? uuid()
+    this.inviteCode = recovered?.invite_code ?? createInviteCode()
     this.gameMode = quizz.gameMode
     this._manager = {
-      id: "",
+      id: recovered?.manager_socket_id ?? "",
       clientId: managerClientId,
-      connected: false,
+      connected: recovered?.manager_connected ?? false,
     }
 
-    this.cooldown = new CooldownTimer(io, this.gameId)
+    this._lease = recovered?.lease
+    this.cooldown = new CooldownTimer(io, this.gameId, () => this.ownsRoom)
 
     this.playerManager = new PlayerManager({
       io,
@@ -85,6 +99,11 @@ class Game {
 
     const storage = cloud
     this.persistence = storage && new CloudGame(storage, this.gameId)
+
+    if (this._lease) {
+      this.persistence?.attachLease(this._lease)
+    }
+
     this.round = new RoundManager({
       quizz,
       players: this.playerManager,
@@ -110,11 +129,27 @@ class Game {
             await storage.prunePlayers(this)
           }
 
-          await storage.phase(this.gameId, { phase, position, closesAt })
+          await storage.phase(
+            this.gameId,
+            { phase, position, closesAt },
+            this.lease,
+          )
         }),
       onFailure: (error) => this.fail(error),
       getSettings: () => this._settings,
+      canRun: () => this.ownsRoom,
     })
+
+    if (recovered) {
+      this._settings = recovered.settings
+      this._locked = recovered.locked
+      this.lastBroadcastStatus = recovered.runtime
+      this.managerStatus =
+        recovered.host_state_position === recovered.current_position
+          ? recovered.host_state
+          : null
+      this.playerManager.replace(recovered.members)
+    }
 
     console.log(
       `New game created: ${this.inviteCode} subject: ${quizz.subject}`,
@@ -125,8 +160,39 @@ class Game {
     return this._manager
   }
 
+  get lease() {
+    return this._lease
+  }
+
+  get ownsRoom() {
+    return !cloud || Boolean(this._lease?.active)
+  }
+
+  attachLease(lease: RoomLease) {
+    if (this._lease && this._lease.token !== lease.token) {
+      throw new LeaseLost(this.gameId)
+    }
+
+    this._lease = lease
+    this.persistence?.attachLease(lease)
+  }
+
+  async assertOwner() {
+    if (cloud) {
+      await withLease(cloud, this.lease, () => Promise.resolve())
+    }
+  }
+
+  resume(recovered: RecoveredRoom) {
+    this.round.restore(recovered)
+  }
+
   get players(): Player[] {
     return this.playerManager.getAll()
+  }
+
+  get finished(): boolean {
+    return this.round.completed
   }
 
   get started(): boolean {
@@ -155,7 +221,9 @@ class Game {
     const previous = this._locked
     this._locked = locked
     const notify = () => {
-      this.io.to(this._manager.id).emit(EVENTS.MANAGER.LOCK_UPDATED, locked)
+      if (this.ownsRoom) {
+        this.io.to(this._manager.id).emit(EVENTS.MANAGER.LOCK_UPDATED, locked)
+      }
     }
 
     if (!cloud) {
@@ -170,16 +238,22 @@ class Game {
 
   // ── Status broadcasting ──────────────────────────────────────────────────
 
-  private broadcastStatus<T extends Status>(status: T, data: StatusDataMap[T]) {
+  private broadcastStatus<T extends Status>(
+    status: T,
+    data: StatusDataMap[T],
+    deadline: Date | null = null,
+  ) {
     const statusData = { name: status, data }
     this.lastBroadcastStatus = statusData
     const emit = () => {
-      this.io.to(this.gameId).emit(EVENTS.GAME.STATUS, statusData)
+      if (this.ownsRoom) {
+        this.io.to(this.gameId).emit(EVENTS.GAME.STATUS, statusData)
+      }
     }
 
     if (this.persistence) {
       return this.persistence
-        .broadcast(statusData, this.round.position)
+        .broadcast(statusData, this.round.position, deadline)
         .then(emit)
     }
 
@@ -200,9 +274,32 @@ class Game {
     }
 
     const emit = () => {
-      this.io.to(target).emit(EVENTS.GAME.STATUS, statusData)
+      if (this.ownsRoom) {
+        this.io.to(target).emit(EVENTS.GAME.STATUS, statusData)
+      }
     }
     const player = this.playerManager.findById(target)
+
+    if (this.persistence && target === this._manager.id) {
+      let delay: number | null = null
+
+      if (status === STATUS.SHOW_RESPONSES) {
+        delay = this.settings.autoAdvance.responsesDelay
+      }
+
+      if (status === STATUS.SHOW_LEADERBOARD) {
+        delay = this.settings.autoAdvance.leaderboardDelay
+      }
+
+      const deadline =
+        this.settings.autoAdvance.enable && delay !== null
+          ? new Date(Date.now() + delay * SECOND_MS)
+          : null
+
+      return this.persistence
+        .managerState(statusData, this.round.position, deadline)
+        .then(emit)
+    }
 
     if (this.persistence && player) {
       return this.persistence
@@ -222,7 +319,8 @@ class Game {
 
     const storage = cloud
     const persist =
-      storage && ((player: Player) => storage.savePlayer(this.gameId, player))
+      storage &&
+      ((player: Player) => storage.savePlayer(this.gameId, player, this.lease))
 
     if (this._settings.generatedUsernames) {
       const taken = this.playerManager.getAll().map((player) => player.username)
@@ -245,6 +343,12 @@ class Game {
   }
 
   private fail(error: unknown) {
+    if (error instanceof LeaseLost) {
+      registry.releaseGame(this.gameId)
+
+      return
+    }
+
     console.error(`Room ${this.gameId} failed:`, error)
     this.io.to(this.gameId).emit(EVENTS.GAME.RESET, "errors:api.serverError")
     registry.removeGame(this.gameId)
@@ -289,6 +393,16 @@ class Game {
   }
 
   private reconnectManager(socket: GameSocket) {
+    if (this.persistence) {
+      return this.persistence
+        .managerConnection(socket.id, true)
+        .then(() => this.applyManagerReconnect(socket))
+    }
+
+    return this.applyManagerReconnect(socket)
+  }
+
+  private applyManagerReconnect(socket: GameSocket) {
     const previousSocketId = this._manager.connected ? this._manager.id : null
 
     socket.join(this.gameId)
@@ -431,6 +545,8 @@ class Game {
 
   setManagerDisconnected() {
     this._manager.connected = false
+
+    return this.persistence?.managerConnection(this._manager.id, false)
   }
 
   removePlayer(socketId: string): Player | undefined {

@@ -12,6 +12,7 @@ import { verifyToken } from "@razzia/socket/services/auth"
 import { cloud } from "@razzia/socket/services/cloud"
 import { CloudGame } from "@razzia/socket/services/cloud-game"
 import { DomainError } from "@razzia/socket/services/errors"
+import { metrics } from "@razzia/socket/services/metrics"
 import { setIo } from "@razzia/socket/services/io"
 import { createAdapter } from "@socket.io/redis-adapter"
 import { Hono } from "hono"
@@ -34,6 +35,11 @@ app.get("/health/ready", async (c) => {
 
   return c.json({ status: "ok" })
 })
+app.get("/metrics", (c) =>
+  c.text(metrics.render(), 200, {
+    "Content-Type": "text/plain; version=0.0.4; charset=utf-8",
+  }),
+)
 app.route("/api", api)
 
 app.notFound((c) =>
@@ -153,6 +159,10 @@ export const createSocketServer = (server: ServerType): Server => {
   })
 
   io.on("connection", (socket) => {
+    metrics.connections += 1
+    socket.once("disconnect", () => {
+      metrics.connections -= 1
+    })
     console.log(
       `A user connected: socketId: ${socket.id}, clientId: ${socket.data.clientId}`,
     )

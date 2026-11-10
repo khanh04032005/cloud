@@ -51,7 +51,7 @@ Khi kết thúc ván, backend kiểm tra điểm trong `results` khớp tổng �
 
 `player:reconnect` giữ nguyên giao thức. Backend đọc thành viên, pha hiển thị, vòng hiện tại, đáp án đã nhận và điểm từ PostgreSQL, cập nhật socket hiện tại rồi trả `player:successReconnect`. Payload có thêm `acceptedAnswer` gồm `answerKeys` và `acceptedAt`, hoặc `null`. Phiên đã trả lời nhận trạng thái chờ để bảo toàn đáp án đầu tiên. Dữ liệu câu đang mở tiếp tục bỏ lời giải.
 
-Nếu gateway không liên lạc được coordinator, nó vẫn có thể khôi phục bản chụp phiên từ DB và tham gia Socket.IO room. Việc tiếp quản game engine và timer sau khi coordinator chết thuộc mốc lease tuần 5. Tắt tiến trình bình thường vẫn thực hiện quy trình hủy phòng đang hoạt động của tuần 3.
+Nếu gateway không liên lạc được coordinator, nó vẫn có thể khôi phục bản chụp phiên từ DB và tham gia Socket.IO room. Việc tiếp quản game engine và timer sau khi coordinator chết thuộc mốc lease tuần 5. Tại mốc tuần 4, dừng replica bình thường vẫn hủy phòng. Tuần 5 thay hành vi này bằng nhả lease để tiếp quản; xem `live-quiz-week-5.md`.
 
 ## Kiểm thử
 

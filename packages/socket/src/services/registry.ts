@@ -87,12 +87,21 @@ class Registry {
   }
 
   removeGame(gameId: string): boolean {
+    const game = this.getGameById(gameId)
+
+    if (game) {
+      void cloud?.removeRoom(gameId, game.lease).catch(console.error)
+    }
+
+    return this.releaseGame(gameId)
+  }
+
+  releaseGame(gameId: string): boolean {
     const initialLength = this.games.length
     const game = this.games.find((g) => g.gameId === gameId)
 
     if (game) {
       game.dispose()
-      void cloud?.removeRoom(gameId).catch(console.error)
     }
 
     this.games = this.games.filter((g) => g.gameId !== gameId)
@@ -136,7 +145,7 @@ class Registry {
 
     removed.forEach((g) => {
       g.game.dispose()
-      void cloud?.removeRoom(g.game.gameId).catch(console.error)
+      void cloud?.removeRoom(g.game.gameId, g.game.lease).catch(console.error)
     })
     this.games = this.games.filter((g) => !removedGameIds.includes(g.gameId))
     this.emptyGames = stillEmpty

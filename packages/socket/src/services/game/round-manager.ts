@@ -26,6 +26,7 @@ import {
 } from "@razzia/common/types/game/status"
 import type { GameSocket } from "@razzia/socket/handlers/types"
 import type { CloudGame } from "@razzia/socket/services/cloud-game"
+import type { RecoveredRoom } from "@razzia/socket/services/game/recovery-state"
 import { CooldownTimer } from "@razzia/socket/services/game/cooldown-timer"
 import { PlayerManager } from "@razzia/socket/services/game/player-manager"
 import {
@@ -40,6 +41,7 @@ import { nanoid } from "nanoid"
 type BroadcastFn = <T extends Status>(
   _status: T,
   _data: StatusDataMap[T],
+  _deadline?: Date | null,
 ) => void | Promise<void>
 type SendFn = <T extends Status>(
   _target: string,
@@ -66,6 +68,7 @@ export interface RoundManagerOptions {
   ) => Promise<void>
   onFailure: (_error: unknown) => void
   getSettings: () => GameSettings
+  canRun?: () => boolean
 }
 
 interface RoundStep {
@@ -79,6 +82,7 @@ interface RoundStep {
 export class RoundManager {
   private readonly opts: RoundManagerOptions
   private readonly steps: RoundStep[]
+  completed = false
   private started = false
   private currentQuestion = 0
   private currentStep = -1
@@ -124,6 +128,10 @@ export class RoundManager {
     this.acceptingAnswers = false
   }
 
+  private running(): boolean {
+    return this.started && (this.opts.canRun?.() ?? true)
+  }
+
   private get question(): Question {
     return this.opts.quizz.questions[this.currentQuestion]
   }
@@ -160,23 +168,41 @@ export class RoundManager {
   }
 
   private emitAutoAdvance(state: { seconds: number; total: number } | null) {
+    if (!(this.opts.canRun?.() ?? true)) {
+      return
+    }
+
     this.opts.io
       .to(this.opts.getManagerId())
       .emit(EVENTS.MANAGER.AUTO_ADVANCE, state)
   }
 
-  private scheduleAutoAdvance(delay: number): void {
+  private scheduleAutoAdvance(delay: number, deadline?: Date | null): void {
     this.clearAutoAdvance()
 
     if (!this.opts.getSettings().autoAdvance.enable) {
       return
     }
 
-    let remaining = delay
+    let remaining = deadline
+      ? Math.max(0, Math.ceil((deadline.getTime() - Date.now()) / SECOND_MS))
+      : delay
+
+    if (remaining === 0) {
+      queueMicrotask(() => this.advance())
+
+      return
+    }
 
     this.emitAutoAdvance({ seconds: remaining, total: delay })
 
     this.autoAdvanceTimer = setInterval(() => {
+      if (!this.running()) {
+        this.clearAutoAdvance()
+
+        return
+      }
+
       remaining -= 1
 
       if (remaining > 0) {
@@ -193,7 +219,7 @@ export class RoundManager {
   // ── Flow ─────────────────────────────────────────────────────────────────
 
   getReconnectInfo(): GameUpdateQuestion | null {
-    if (!this.started) {
+    if (!this.running()) {
       return null
     }
 
@@ -224,10 +250,14 @@ export class RoundManager {
       await this.opts.savePhase("running")
     }
 
-    await this.opts.broadcast(STATUS.SHOW_START, {
-      time: 3,
-      subject: this.opts.quizz.subject,
-    })
+    await this.opts.broadcast(
+      STATUS.SHOW_START,
+      {
+        time: 3,
+        subject: this.opts.quizz.subject,
+      },
+      new Date(Date.now() + 6 * SECOND_MS),
+    )
 
     const countdown = this.startCountdown()
 
@@ -244,7 +274,7 @@ export class RoundManager {
   private async startCountdown(): Promise<void> {
     await sleep(3)
 
-    if (!this.started) {
+    if (!this.running()) {
       return
     }
 
@@ -255,7 +285,7 @@ export class RoundManager {
   }
 
   advance(): void {
-    if (!this.started || this.processing) {
+    if (!this.running() || this.processing) {
       return
     }
 
@@ -295,7 +325,7 @@ export class RoundManager {
         .then(() => {
           this.processing = false
 
-          if (this.started) {
+          if (this.running()) {
             this.scheduleAutoAdvance(step.delay(this.opts.getSettings()))
           }
         })
@@ -320,98 +350,205 @@ export class RoundManager {
     void this.newQuestion().catch(this.opts.onFailure)
   }
 
+  private async pauseUntil(deadline: Date) {
+    if (this.running()) {
+      await sleep(Math.max(0, (deadline.getTime() - Date.now()) / SECOND_MS))
+    }
+  }
+
   private async newQuestion(): Promise<void> {
-    if (!this.started) {
+    if (!this.running()) {
       return
     }
 
     this.currentStep = -1
-
     this.opts.onNewQuestion()
-
     this.opts.io.to(this.opts.gameId).emit(EVENTS.GAME.UPDATE_QUESTION, {
-      current: this.currentQuestion + 1,
+      current: this.position,
       total: this.opts.quizz.questions.length,
     })
+    const deadline = new Date(Date.now() + 2 * SECOND_MS)
+    await this.opts.broadcast(
+      STATUS.SHOW_PREPARED,
+      {
+        totalAnswers: this.question.answers.length,
+        questionNumber: this.position,
+        questionType: this.question.type,
+      },
+      deadline,
+    )
+    await this.pauseUntil(deadline)
+    await this.showQuestion()
+  }
 
-    await this.opts.broadcast(STATUS.SHOW_PREPARED, {
-      totalAnswers: this.question.answers.length,
-      questionNumber: this.currentQuestion + 1,
-      questionType: this.question.type,
-    })
-
-    await sleep(2)
-
-    if (!this.started) {
+  private async showQuestion() {
+    if (!this.running()) {
       return
     }
 
-    const imageMedia = (() => {
-      if (this.question.media?.type !== MEDIA_TYPES.IMAGE) {
-        return undefined
-      }
+    const deadline = new Date(Date.now() + this.question.cooldown * SECOND_MS)
+    const media =
+      this.question.media?.type === MEDIA_TYPES.IMAGE
+        ? this.question.media
+        : undefined
+    await this.opts.broadcast(
+      STATUS.SHOW_QUESTION,
+      {
+        question: this.question.question,
+        media,
+        cooldown: this.question.cooldown,
+      },
+      deadline,
+    )
+    await this.pauseUntil(deadline)
+    await this.openAnswers()
+  }
 
-      return this.question.media
-    })()
-
-    await this.opts.broadcast(STATUS.SHOW_QUESTION, {
-      question: this.question.question,
-      media: imageMedia,
-      cooldown: this.question.cooldown,
-    })
-
-    await sleep(this.question.cooldown)
-
-    if (!this.started) {
+  private async openAnswers() {
+    if (!this.running()) {
       return
     }
 
     this.startTime = Date.now()
+    const deadline =
+      this.question.time === NO_TIME_LIMIT
+        ? null
+        : new Date(this.startTime + this.question.time * SECOND_MS)
 
     if (this.opts.savePhase) {
-      const closesAt =
-        this.question.time === NO_TIME_LIMIT
-          ? null
-          : new Date(this.startTime + this.question.time * SECOND_MS)
-      await this.opts.savePhase("open", this.currentQuestion + 1, closesAt)
+      await this.opts.savePhase("open", this.position, deadline)
+    }
 
-      if (!this.started) {
-        return
-      }
+    if (!this.running()) {
+      return
+    }
+
+    const roundId = await this.opts.persistence?.roundId(this.position)
+    await this.opts.broadcast(
+      STATUS.SELECT_ANSWER,
+      {
+        ...(roundId && { roundId }),
+        question: this.question.question,
+        answers: this.question.answers,
+        media: this.question.media,
+        time: this.question.time,
+        totalPlayer: this.opts.players.count(),
+        questionType: this.question.type,
+        options: this.question.options,
+        answersOnly: this.opts.getSettings().answersOnly,
+      },
+      deadline,
+    )
+
+    await this.answerWindow(deadline)
+  }
+
+  private async answerWindow(deadline: Date | null) {
+    if (!this.running()) {
+      return
     }
 
     this.acceptingAnswers = true
 
-    const roundId = await this.opts.persistence?.roundId(this.position)
-    await this.opts.broadcast(STATUS.SELECT_ANSWER, {
-      ...(roundId && { roundId }),
-      question: this.question.question,
-      answers: this.question.answers,
-      media: this.question.media,
-      time: this.question.time,
-      totalPlayer: this.opts.players.count(),
-      questionType: this.question.type,
-      options: this.question.options,
-      answersOnly: this.opts.getSettings().answersOnly,
-    })
+    const waiting = this.opts.cooldown.until(deadline)
 
-    await this.opts.cooldown.start(this.question.time)
+    this.endIfEveryoneAnswered()
 
+    await waiting
     this.acceptingAnswers = false
 
-    if (!this.started) {
+    if (!this.running()) {
       return
     }
 
     if (this.opts.savePhase) {
-      await this.opts.savePhase("closed", this.currentQuestion + 1)
+      await this.opts.savePhase("closed", this.position)
     }
+
+    if (!this.running()) {
+      return
+    }
+
+    this.runStep(0)
+  }
+
+  restore(snapshot: RecoveredRoom) {
+    this.currentQuestion = Math.max(0, snapshot.current_position - 1)
+    this.started = snapshot.status === "running"
+
+    this.questionsHistory = snapshot.history
+    this.playersAnswers = snapshot.answers
+    this.leaderboard = snapshot.members.map((player) => ({ ...player }))
+    this.currentStep = -1
+    this.processing = false
 
     if (!this.started) {
       return
     }
 
-    this.runStep(0)
+    void this.resumeStage(snapshot).catch(this.opts.onFailure)
+  }
+
+  private async resumeStage(snapshot: RecoveredRoom) {
+    if (!this.running()) {
+      return
+    }
+
+    if (snapshot.round_status === "open") {
+      await this.answerWindow(snapshot.closes_at)
+
+      return
+    }
+
+    if (snapshot.round_status === "closed") {
+      const state =
+        snapshot.host_state_position === snapshot.current_position
+          ? snapshot.host_state
+          : null
+
+      if (
+        state?.name === STATUS.SHOW_RESPONSES ||
+        state?.name === STATUS.SHOW_LEADERBOARD
+      ) {
+        this.currentStep = state.name === STATUS.SHOW_RESPONSES ? 0 : 1
+        const step = this.steps[this.currentStep]
+        this.scheduleAutoAdvance(
+          step.delay(this.opts.getSettings()),
+          snapshot.auto_advance_at,
+        )
+      } else {
+        this.runStep(0)
+      }
+
+      return
+    }
+
+    const stage = snapshot.runtime?.name
+    let fallback = 6
+
+    if (stage === STATUS.SHOW_PREPARED) {
+      fallback = 2
+    }
+
+    if (stage === STATUS.SHOW_QUESTION) {
+      fallback = this.question.cooldown
+    }
+
+    const deadline =
+      snapshot.stage_deadline ?? new Date(Date.now() + fallback * SECOND_MS)
+    await this.pauseUntil(deadline)
+
+    if (!this.running()) {
+      return
+    }
+
+    if (stage === STATUS.SHOW_PREPARED) {
+      await this.showQuestion()
+    } else if (stage === STATUS.SHOW_QUESTION) {
+      await this.openAnswers()
+    } else {
+      await this.newQuestion()
+    }
   }
 
   // ── Steps ────────────────────────────────────────────────────────────────
@@ -506,7 +643,9 @@ export class RoundManager {
   }
 
   private async showCloudResults(persistence: CloudGame) {
-    if (!(await persistence.waitForScores(this.position, () => this.started))) {
+    if (
+      !(await persistence.waitForScores(this.position, () => this.running()))
+    ) {
       return
     }
 
@@ -593,10 +732,17 @@ export class RoundManager {
     if (this.opts.persistence) {
       this.processing = true
 
-      return this.finishCloud(this.opts.persistence).catch(this.opts.onFailure)
+      return this.finishCloud(this.opts.persistence)
+        .then(() => {
+          if (!this.started) {
+            this.completed = true
+          }
+        })
+        .catch(this.opts.onFailure)
     }
 
     this.started = false
+    this.completed = true
     this.clearAutoAdvance()
     void this.opts.savePhase?.("finished").catch(this.opts.onFailure)
 
@@ -648,7 +794,7 @@ export class RoundManager {
   private async finishCloud(persistence: CloudGame) {
     this.clearAutoAdvance()
 
-    if (!(await persistence.waitForScores(null, () => this.started))) {
+    if (!(await persistence.waitForScores(null, () => this.running()))) {
       return
     }
 
