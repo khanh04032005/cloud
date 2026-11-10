@@ -102,9 +102,7 @@ const bindGameHandlers = (io: Server, socket: GameSocket, on: Register) => {
     const game = registry.getManagerGame(gameId, clientId)
 
     if (game) {
-      game.reconnect(socket)
-
-      return
+      return game.reconnect(socket)
     }
 
     socket.emit(EVENTS.GAME.RESET, "errors:game.expired")
@@ -427,6 +425,19 @@ export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
                 }
 
                 socket.emit(EVENTS.PLAYER.SUCCESS_RECONNECT, restored.payload)
+                reply = { joined: true }
+              }
+            }
+
+            if (reply === "missing" && event === EVENTS.MANAGER.RECONNECT) {
+              const snapshot = await new CloudGame(
+                storage,
+                gameId,
+              ).finishedHost(socket)
+
+              if (snapshot) {
+                await socket.join(gameId)
+                socket.emit(EVENTS.MANAGER.SUCCESS_RECONNECT, snapshot)
                 reply = { joined: true }
               }
             }

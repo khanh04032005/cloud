@@ -384,9 +384,7 @@ class Game {
     const clientId = getClientId(socket)
 
     if (this._manager.clientId === clientId) {
-      this.reconnectManager(socket)
-
-      return
+      return this.reconnectManager(socket)
     }
 
     return this.reconnectPlayer(socket)

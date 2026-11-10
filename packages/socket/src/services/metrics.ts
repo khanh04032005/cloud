@@ -2,7 +2,7 @@ const buckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
 type Counter =
   "leases_acquired" | "leases_lost" | "rooms_recovered" | "rounds_closed"
 
-class Metrics {
+export class Metrics {
   connections = 0
   ownedRooms = 0
   private readonly counters: Record<Counter, number> = {

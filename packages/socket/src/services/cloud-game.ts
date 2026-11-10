@@ -461,6 +461,51 @@ export class CloudGame {
     })
   }
 
+  async finishedHost(socket: GameSocket) {
+    if (socket.data.role !== "manager") {
+      return undefined
+    }
+
+    type Host = Parameters<
+      ServerToClientEvents[typeof EVENTS.MANAGER.SUCCESS_RECONNECT]
+    >[0]
+    const { rows } = await this.storage.pool.query<{
+      invite_code: string
+      settings: Host["settings"]
+      locked: boolean
+      host_state: GameState
+      current_position: number
+      total: number
+    }>(
+      `SELECT invite_code, settings, locked, host_state, current_position,
+         (SELECT count(*)::integer FROM rounds WHERE room_id = rooms.id) AS total
+       FROM rooms WHERE id = $1 AND host_client_id = $2 AND status = 'finished' AND host_state IS NOT NULL`,
+      [this.gameId, socket.data.clientId],
+    )
+
+    const room = rows.at(0)
+
+    if (!room) {
+      return undefined
+    }
+
+    const players = await this.scores(room.current_position)
+    const payload: Host = {
+      gameId: this.gameId,
+      inviteCode: room.invite_code,
+      settings: room.settings,
+      locked: room.locked,
+      status: room.host_state,
+      players: players.filter((player) => player.active),
+      currentQuestion:
+        room.current_position > 0
+          ? { current: room.current_position, total: room.total }
+          : null,
+    }
+
+    return payload
+  }
+
   async disconnect(socketId: string) {
     await this.storage.pool.query(
       "UPDATE players SET connected = false WHERE room_id = $1 AND socket_id = $2",
@@ -485,9 +530,39 @@ export class CloudGame {
         "INSERT INTO game_reports (id, room_id, report) VALUES ($1, $2, $3) ON CONFLICT (room_id) DO NOTHING",
         [report.id, this.gameId, report],
       )
+      const top = report.players
+        .slice(0, 3)
+        .map(({ username, points, rank }) => ({ username, points, rank }))
+      const summary = {
+        subject: report.subject,
+        totalPlayers: report.players.length,
+        totalQuestions: report.questions.length,
+      }
+      const hostState =
+        report.gameMode === "survey"
+          ? { name: STATUS.SUMMARY, data: summary }
+          : { name: STATUS.FINISHED, data: { subject: report.subject, top } }
       await client.query(
-        "UPDATE rooms SET status = 'finished', finished_at = now() WHERE id = $1 AND status = 'running'",
-        [this.gameId],
+        `WITH ranked AS (
+           SELECT id, rank() OVER (ORDER BY COALESCE(r.points, 0) DESC)::integer AS rank
+           FROM players p LEFT JOIN results r ON r.room_id = p.room_id AND r.player_id = p.id WHERE p.room_id = $1
+         ) UPDATE players p SET state = CASE WHEN $2 THEN $3::jsonb ELSE
+           jsonb_build_object('name', $4::text, 'data', $5::jsonb || jsonb_build_object('rank', ranked.rank)) END,
+           state_position = (SELECT current_position FROM rooms WHERE id = $1)
+         FROM ranked WHERE p.room_id = $1 AND p.id = ranked.id`,
+        [
+          this.gameId,
+          report.gameMode === "survey",
+          JSON.stringify(hostState),
+          STATUS.FINISHED,
+          JSON.stringify({ subject: report.subject, top }),
+        ],
+      )
+      await client.query(
+        `UPDATE rooms SET status = 'finished', finished_at = COALESCE(finished_at, now()),
+           runtime = $2, host_state = $2, host_state_position = current_position, stage_deadline = NULL, auto_advance_at = NULL
+         WHERE id = $1 AND status IN ('running', 'finished')`,
+        [this.gameId, hostState],
       )
     })
   }

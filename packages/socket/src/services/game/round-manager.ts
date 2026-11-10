@@ -423,6 +423,11 @@ export class RoundManager {
       return
     }
 
+    await this.publishAnswers(deadline)
+    await this.answerWindow(deadline)
+  }
+
+  private async publishAnswers(deadline: Date | null) {
     const roundId = await this.opts.persistence?.roundId(this.position)
     await this.opts.broadcast(
       STATUS.SELECT_ANSWER,
@@ -439,8 +444,6 @@ export class RoundManager {
       },
       deadline,
     )
-
-    await this.answerWindow(deadline)
   }
 
   private async answerWindow(deadline: Date | null) {
@@ -495,6 +498,10 @@ export class RoundManager {
     }
 
     if (snapshot.round_status === "open") {
+      if (snapshot.runtime?.name !== STATUS.SELECT_ANSWER) {
+        await this.publishAnswers(snapshot.closes_at)
+      }
+
       await this.answerWindow(snapshot.closes_at)
 
       return

@@ -1,3 +1,4 @@
+import type { GameResult } from "@razzia/common/types/game"
 import { spawn } from "node:child_process"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -395,6 +396,18 @@ it("takes over a killed coordinator without resetting the round or duplicating a
       [gameId],
     )
     expect(counts).toEqual({ answers: 2, events: 2 })
+    await delay(1100)
+    const finishedHost = await connect(CLOUD_TEST_B, hostToken)
+    const finalHostSnapshot = nextEvent(
+      finishedHost,
+      EVENTS.MANAGER.SUCCESS_RECONNECT,
+    )
+    finishedHost.emit(EVENTS.MANAGER.RECONNECT, { gameId })
+    await expect(finalHostSnapshot).resolves.toMatchObject({
+      status: { name: STATUS.FINISHED },
+      players: [{ points: 1 }, { points: 1 }],
+    })
+
     await redis.del(`razzia:room:${gameId}`)
     second.socket.disconnect()
     const databaseOnly = await connect(CLOUD_TEST_B, second.session.token)
@@ -419,3 +432,329 @@ it("takes over a killed coordinator without resetting the round or duplicating a
     await rm(owner.directory, { recursive: true, force: true })
   }
 }, 45000)
+
+interface RecoveryRow {
+  id: string
+  name: string
+  status: string
+  owner_epoch: number
+  stage_deadline: Date | null
+  auto_advance_at: Date | null
+  closes_at: Date | null
+  closed_at: Date | null
+  report: GameResult
+}
+
+it
+  .skipIf(
+    !GATEWAY_A ||
+      !CLOUD_TEST_B ||
+      !CLOUD_TEST_DATABASE_URL ||
+      !CLOUD_TEST_REDIS_URL,
+  )
+  .each(["lobby", "prepared", "question", "open-gap", "expired", "results"])(
+  "recovers the %s phase after coordinator termination",
+  async (phase) => {
+    if (
+      !GATEWAY_A ||
+      !CLOUD_TEST_B ||
+      !CLOUD_TEST_DATABASE_URL ||
+      !CLOUD_TEST_REDIS_URL
+    ) {
+      throw new Error("Cloud integration environment is missing")
+    }
+
+    const owner = await startOwner(
+      CLOUD_TEST_DATABASE_URL,
+      CLOUD_TEST_REDIS_URL,
+    )
+    const pool = new Pool({ connectionString: CLOUD_TEST_DATABASE_URL })
+    const sockets: Client[] = []
+    const connect = async (token: string) => {
+      const socket: Client = io(CLOUD_TEST_B, {
+        path: "/ws",
+        auth: { token },
+        transports: ["websocket"],
+        reconnection: false,
+      })
+      sockets.push(socket)
+      await nextEvent(socket, "connect")
+
+      return socket
+    }
+    let roomId: string | undefined = undefined
+
+    try {
+      const hostSession = (await json(owner.url, "/api/auth/manager", {
+        data: { password: "test-password" },
+      })) as SessionResponse
+      const quiz = (await json(owner.url, "/api/quizz", {
+        token: hostSession.token,
+        data: {
+          subject: `Recovery ${phase}`,
+          gameMode: "quiz",
+          questions: [
+            {
+              type: "single",
+              question: "Keep deadline?",
+              answers: ["Yes", "No"],
+              solutions: [0],
+              cooldown: phase === "question" ? 15 : 3,
+              time: phase === "expired" ? 4 : 60,
+            },
+          ],
+        },
+      })) as { id: string }
+      const created = (await json(owner.url, "/api/games", {
+        token: hostSession.token,
+        data: { quizzId: quiz.id },
+      })) as { gameId: string; inviteCode: string }
+      roomId = created.gameId
+      const gameId = roomId
+      const host = await connect(hostSession.token)
+      const hostReady = nextEvent(host, EVENTS.MANAGER.SUCCESS_RECONNECT)
+      host.emit(EVENTS.MANAGER.RECONNECT, { gameId })
+      await hostReady
+      await json(CLOUD_TEST_B, `/api/games/${gameId}/settings`, {
+        token: hostSession.token,
+        method: "PATCH",
+        data: {
+          answersOnly: true,
+          autoAdvance: {
+            enable: phase === "results",
+            responsesDelay: 20,
+            leaderboardDelay: 20,
+          },
+        },
+      })
+      const session = (await json(CLOUD_TEST_B, "/api/auth/session", {
+        data: {},
+      })) as SessionResponse
+      const { ticket } = (await json(CLOUD_TEST_B, "/api/games/join", {
+        token: session.token,
+        data: { inviteCode: created.inviteCode, username: "Survivor" },
+      })) as { ticket: string }
+      const player = await connect(session.token)
+      const joined = nextEvent(player, EVENTS.GAME.SUCCESS_JOIN)
+      player.emit(EVENTS.PLAYER.LOGIN, { ticket })
+      await joined
+      const statuses: Array<{ name: string; data: unknown }> = []
+      player.on(EVENTS.GAME.STATUS, (status) => {
+        statuses.push(status)
+      })
+
+      if (phase !== "lobby") {
+        let target: string = STATUS.SELECT_ANSWER
+
+        if (phase === "prepared") {
+          target = STATUS.SHOW_PREPARED
+        }
+
+        if (phase === "question") {
+          target = STATUS.SHOW_QUESTION
+        }
+
+        host.emit(EVENTS.MANAGER.START_GAME, { gameId })
+        await expect
+          .poll(() => statuses.some((status) => status.name === target), {
+            timeout: 12000,
+            interval: 20,
+          })
+          .toBe(true)
+
+        if (phase === "results") {
+          const question = statuses.find(
+            (status) => status.name === STATUS.SELECT_ANSWER,
+          )?.data as { roundId: string }
+          const accepted = nextEvent(player, EVENTS.PLAYER.ANSWER_ACK)
+          player.emit(EVENTS.PLAYER.SELECTED_ANSWER, {
+            gameId,
+            roundId: question.roundId,
+            data: { answerKeys: [0] },
+          })
+          await expect(accepted).resolves.toMatchObject({ status: "accepted" })
+          await applyScoreFixture(pool, gameId)
+          await expect
+            .poll(async () => {
+              const {
+                rows: [room],
+              } = await pool.query<RecoveryRow>(
+                "SELECT host_state->>'name' AS name FROM rooms WHERE id = $1",
+                [gameId],
+              )
+
+              return room.name
+            })
+            .toBe(STATUS.SHOW_RESPONSES)
+        }
+      }
+
+      if (phase === "open-gap") {
+        await pool.query("UPDATE rooms SET runtime = $2 WHERE id = $1", [
+          gameId,
+          {
+            name: STATUS.SHOW_QUESTION,
+            data: { question: "Keep deadline?", cooldown: 3 },
+          },
+        ])
+        statuses.length = 0
+      }
+
+      const {
+        rows: [before],
+      } = await pool.query<RecoveryRow>(
+        "SELECT owner_epoch, stage_deadline, auto_advance_at FROM rooms WHERE id = $1",
+        [gameId],
+      )
+      const {
+        rows: [roundBefore],
+      } = await pool.query<RecoveryRow>(
+        "SELECT id, closes_at, closed_at FROM rounds WHERE room_id = $1",
+        [gameId],
+      )
+      owner.process.kill("SIGKILL")
+      await expect
+        .poll(
+          async () => {
+            const {
+              rows: [room],
+            } = await pool.query<RecoveryRow>(
+              "SELECT owner_epoch FROM rooms WHERE id = $1",
+              [gameId],
+            )
+
+            return room.owner_epoch
+          },
+          { timeout: 12000 },
+        )
+        .toBe(before.owner_epoch + 1)
+      // A command is routed only after snapshot hydration is complete.
+      const hostRestored = nextEvent(host, EVENTS.MANAGER.SUCCESS_RECONNECT)
+      host.emit(EVENTS.MANAGER.RECONNECT, { gameId })
+      await expect(hostRestored).resolves.toMatchObject({
+        gameId,
+        settings: { answersOnly: true },
+        players: [{ username: "Survivor" }],
+      })
+      const restored = nextEvent(player, EVENTS.PLAYER.SUCCESS_RECONNECT)
+      player.emit(EVENTS.PLAYER.RECONNECT, { gameId })
+      await expect(restored).resolves.toMatchObject({ gameId })
+
+      if (phase === "lobby") {
+        host.emit(EVENTS.MANAGER.START_GAME, { gameId })
+        await expect
+          .poll(
+            () =>
+              statuses.some((status) => status.name === STATUS.SELECT_ANSWER),
+            { timeout: 12000 },
+          )
+          .toBe(true)
+      } else if (phase === "expired") {
+        await expect
+          .poll(async () => {
+            const {
+              rows: [round],
+            } = await pool.query<RecoveryRow>(
+              "SELECT status FROM rounds WHERE id = $1",
+              [roundBefore.id],
+            )
+
+            return round.status
+          })
+          .toBe("closed")
+        const rejected = nextEvent(player, EVENTS.PLAYER.ANSWER_ACK)
+        player.emit(EVENTS.PLAYER.SELECTED_ANSWER, {
+          gameId,
+          roundId: roundBefore.id,
+          data: { answerKeys: [0] },
+        })
+        await expect(rejected).resolves.toMatchObject({ status: "closed" })
+        const {
+          rows: [round],
+        } = await pool.query<RecoveryRow>(
+          "SELECT closes_at, closed_at FROM rounds WHERE id = $1",
+          [roundBefore.id],
+        )
+        expect(round.closes_at).toEqual(roundBefore.closes_at)
+        await delay(150)
+        const {
+          rows: [again],
+        } = await pool.query<RecoveryRow>(
+          "SELECT closed_at FROM rounds WHERE id = $1",
+          [roundBefore.id],
+        )
+        expect(again.closed_at).toEqual(round.closed_at)
+      } else if (phase === "results") {
+        const {
+          rows: [restoredRoom],
+        } = await pool.query<RecoveryRow>(
+          "SELECT auto_advance_at FROM rooms WHERE id = $1",
+          [gameId],
+        )
+        expect(restoredRoom.auto_advance_at).toEqual(before.auto_advance_at)
+        const {
+          rows: [round],
+        } = await pool.query<RecoveryRow>(
+          "SELECT closed_at FROM rounds WHERE id = $1",
+          [roundBefore.id],
+        )
+        expect(round.closed_at).toEqual(roundBefore.closed_at)
+        await expect
+          .poll(
+            async () => {
+              const {
+                rows: [room],
+              } = await pool.query<RecoveryRow>(
+                "SELECT status FROM rooms WHERE id = $1",
+                [gameId],
+              )
+
+              return room.status
+            },
+            { timeout: 6000 },
+          )
+          .toBe("finished")
+        const {
+          rows: [report],
+        } = await pool.query<RecoveryRow>(
+          "SELECT report FROM game_reports WHERE room_id = $1",
+          [gameId],
+        )
+        expect(report.report).toMatchObject({
+          players: [{ points: 1, rank: 1 }],
+        })
+        expect(report.report.questions).toHaveLength(1)
+      } else {
+        await expect
+          .poll(
+            () =>
+              statuses.some((status) => status.name === STATUS.SELECT_ANSWER),
+            { timeout: 8000 },
+          )
+          .toBe(true)
+      }
+
+      const probes = await Promise.all(
+        ["/health/live", "/health/ready", "/metrics"].map((path) =>
+          fetch(CLOUD_TEST_B + path),
+        ),
+      )
+      expect(probes.every((response) => response.ok)).toBe(true)
+    } finally {
+      if (roomId) {
+        await pool.query<RecoveryRow>(
+          "UPDATE rooms SET status = 'cancelled' WHERE id = $1 AND status IN ('lobby', 'running')",
+          [roomId],
+        )
+      }
+
+      sockets.forEach((socket) => {
+        socket.disconnect()
+      })
+      owner.process.kill()
+      await pool.end()
+      await rm(owner.directory, { recursive: true, force: true })
+    }
+  },
+  45000,
+)

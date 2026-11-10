@@ -12,4 +12,7 @@ This folder covers the basic setup (config, quizzes, branding) as well as more a
 - The [Live Quiz week 1–2 handoff](live-quiz-week-1-2.md) covers the game event flow, PostgreSQL migration, and contracts for streaming and split deployment.
 - The [week 4 backend handoff](live-quiz-week-4.md) covers answer transactions, the score worker contract, database reconnect and final reports.
 
+- The [week 5 backend handoff](live-quiz-week-5.md) covers fenced room leases, engine recovery, health and metrics.
+- The [final Person A handoff](live-quiz-person-a-handoff.md) records the final fixes, report chapters, verification evidence and integration/demo steps.
+
 Back to the [main README](../README.md).

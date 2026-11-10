@@ -1,8 +1,10 @@
+import { STATUS } from "@razzia/common/types/game/status"
 import { randomUUID } from "node:crypto"
-import { afterAll, beforeAll, expect, it } from "vitest"
+import { afterAll, afterEach, beforeAll, expect, it } from "vitest"
 import { Cloud } from "@razzia/socket/services/cloud"
 import {
   acquireLease,
+  acquireLocked,
   renewLease,
   releaseLease,
   withLease,
@@ -24,6 +26,13 @@ beforeAll(async () => {
 
   storage = new Cloud(database, redis)
   await storage.connect()
+})
+
+afterEach(async () => {
+  await storage?.pool.query(
+    "UPDATE rooms SET status = 'cancelled' WHERE id = ANY($1::uuid[]) AND status IN ('lobby', 'running')",
+    [rooms],
+  )
 })
 
 afterAll(async () => {
@@ -78,7 +87,8 @@ const fixture = async () => {
     time: 30,
     cooldown: 3,
   }
-  await storage.transaction(async (client) => {
+  const fixtureStorage = storage
+  const lease = await storage.transaction(async (client) => {
     await client.query(
       "INSERT INTO rooms (id, invite_code, host_client_id, subject, status, current_position) VALUES ($1, $2, $3, 'Answer test', 'running', 1)",
       [
@@ -95,10 +105,11 @@ const fixture = async () => {
       "INSERT INTO players (room_id, id, username, socket_id, connected) VALUES ($1, $2, 'Test player', $3, true)",
       [roomId, playerId, socketId],
     )
+
+    return acquireLocked(fixtureStorage, roomId, client)
   })
   rooms.push(roomId)
   const game = new CloudGame(storage, roomId)
-  const lease = await acquireLease(storage, roomId)
 
   if (!lease) {
     throw new Error("Fixture lease was not acquired")
@@ -321,5 +332,83 @@ it.skipIf(!enabled)(
       }),
     ).resolves.toBe(1)
     await releaseLease(db, successor)
+  },
+)
+
+it.skipIf(!enabled)(
+  "keeps one answer and outbox event through a burst of 64 retries",
+  async () => {
+    const { storage: db, game, roomId, submission } = await fixture()
+    const receipts = await Promise.all(
+      Array.from({ length: 64 }, (_, index) =>
+        game.accept({ ...submission, keys: [index % 2] }),
+      ),
+    )
+    expect(
+      receipts.filter((receipt) => receipt.status === "accepted"),
+    ).toHaveLength(1)
+    expect(
+      receipts.filter((receipt) => receipt.status === "duplicate"),
+    ).toHaveLength(63)
+    const canonical = receipts.find((receipt) => receipt.status === "accepted")
+    expect(
+      receipts.every(
+        (receipt) =>
+          JSON.stringify(receipt.answerKeys) ===
+          JSON.stringify(canonical?.answerKeys),
+      ),
+    ).toBe(true)
+    const {
+      rows: [counts],
+    } = await db.pool.query<{ answers: number; events: number }>(
+      "SELECT (SELECT count(*)::integer FROM answers WHERE room_id = $1) AS answers, (SELECT count(*)::integer FROM outbox WHERE round_id IN (SELECT id FROM rounds WHERE room_id = $1)) AS events",
+      [roomId],
+    )
+    expect(counts).toEqual({ answers: 1, events: 1 })
+  },
+)
+
+it.skipIf(!enabled)(
+  "commits final reconnect snapshots with the report before final socket notifications",
+  async () => {
+    const { storage: db, game, roomId, playerId, submission } = await fixture()
+    await game.accept(submission)
+    await applyScoreFixture(db.pool, roomId)
+    await game.saveReport({
+      id: randomUUID(),
+      gameMode: "quiz",
+      subject: "Atomic final",
+      date: new Date().toISOString(),
+      players: [{ username: "Test player", points: 1, rank: 1 }],
+      questions: [],
+    })
+    const recovered = await new CloudGame(db, roomId).reconnect({
+      id: "after-crash",
+      data: { clientId: playerId, role: "player" },
+    } as GameSocket)
+    expect(recovered?.payload.status).toMatchObject({
+      name: STATUS.FINISHED,
+      data: { rank: 1, subject: "Atomic final" },
+    })
+  },
+)
+
+it.skipIf(!enabled)(
+  "drops readiness when its Redis dependency is disconnected",
+  async () => {
+    if (!database || !redis) {
+      throw new Error("Test dependencies unavailable")
+    }
+
+    const probe = new Cloud(database, redis)
+
+    try {
+      await probe.connect()
+      expect(await probe.ready()).toBe(true)
+      probe.redis.destroy()
+      expect(await probe.ready()).toBe(false)
+    } finally {
+      await probe.close()
+    }
   },
 )
