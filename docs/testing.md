@@ -41,6 +41,16 @@ The Vitest config lives in `vitest.config.ts` and splits the tests into three pr
 
 The server returns translation keys (`errors:game.notFound`), not texts, so tests check the keys.
 
+### Two-replica integration test
+
+Use two socket processes with the same test PostgreSQL database, Redis instance, JWT secret and manager password. Apply all four migrations in [Shared room state](configuration.md#shared-room-state) first. The test creates a room and plays one round. Set `GAME_SPEED=5` on both servers to shorten the startup countdown. The week 4 integration test uses a database fixture for B's worker contract, described in the [backend handoff](live-quiz-week-4.md).
+
+```sh
+CLOUD_TEST_A=http://localhost:3001 CLOUD_TEST_B=http://localhost:3002 \
+  CLOUD_TEST_DATABASE_URL="$DATABASE_URL" CLOUD_TEST_REDIS_URL="$REDIS_URL" \
+  CLOUD_TEST_MANAGER_PASSWORD=test-password pnpm test --project socket cloud.test.ts
+```
+
 ## End-to-end tests
 
 ```
@@ -93,3 +103,7 @@ Keep e2e tests for what needs a browser and several clients. Logic that can be c
 - **Lint & Format**: `pnpm format` and `pnpm lint`.
 - **Tests**: the build, then the unit and integration tests.
 - **E2E Tests**: the Playwright tests. When a test fails, the traces are uploaded as the `playwright-traces` artifact. Open one with `pnpm --filter @razzia/e2e exec playwright show-trace <trace.zip>`.
+
+### Local cloud regression runner (PowerShell)
+
+Run `pwsh -File scripts/test-cloud.ps1` from the repository root with Node 24, pnpm and Docker available. It starts temporary PostgreSQL 16 and Redis 7 containers, applies migrations 001�004, launches two backend processes, then runs all Vitest projects. `failover.test.ts` starts a third coordinator and forcibly terminates it. Test data and the worker transaction fixture are isolated from production; no Kafka broker is started. All child processes and containers are stopped in `finally`.

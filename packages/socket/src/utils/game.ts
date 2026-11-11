@@ -1,6 +1,6 @@
 import { MAX_POINTS } from "@razzia/common/constants"
 import type { Question } from "@razzia/common/types/game"
-import type { Socket } from "@razzia/common/types/game/socket"
+import type { GameSocket } from "@razzia/socket/handlers/types"
 import Game from "@razzia/socket/services/game"
 import Registry from "@razzia/socket/services/registry"
 import { SECOND_MS } from "@razzia/socket/utils/sleep"
@@ -13,9 +13,9 @@ const resolveGame = (gameId: string | undefined): Game | undefined =>
 
 export const withManagerGame = (
   gameId: string | undefined,
-  socket: Socket,
+  socket: GameSocket,
   callback: GameCallback,
-): void => {
+) => {
   const game = resolveGame(gameId)
 
   if (!game) {
@@ -30,14 +30,14 @@ export const withManagerGame = (
     return
   }
 
-  callback(game)
+  return callback(game)
 }
 
 export const withPlayerGame = (
   gameId: string | undefined,
-  socket: Socket,
+  socket: GameSocket,
   callback: GameCallback,
-): void => {
+) => {
   const game = resolveGame(gameId)
 
   if (!game) {
@@ -52,7 +52,7 @@ export const withPlayerGame = (
     return
   }
 
-  callback(game)
+  return callback(game)
 }
 
 export const createInviteCode = (length = 6) => {

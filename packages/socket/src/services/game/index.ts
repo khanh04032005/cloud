@@ -5,16 +5,25 @@ import type {
   Quizz,
   QuizzMode,
 } from "@razzia/common/types/game"
-import type { Server, Socket } from "@razzia/common/types/game/socket"
+import type { Server } from "@razzia/common/types/game/socket"
 import {
   STATUS,
   type Status,
   type StatusDataMap,
 } from "@razzia/common/types/game/status"
+import type { GameSocket } from "@razzia/socket/handlers/types"
+import { cloud } from "@razzia/socket/services/cloud"
+import { CloudGame } from "@razzia/socket/services/cloud-game"
 import { saveResult } from "@razzia/socket/services/config"
 import { CooldownTimer } from "@razzia/socket/services/game/cooldown-timer"
 import { PlayerManager } from "@razzia/socket/services/game/player-manager"
 import { RoundManager } from "@razzia/socket/services/game/round-manager"
+import type { RecoveredRoom } from "@razzia/socket/services/game/recovery-state"
+import {
+  LeaseLost,
+  withLease,
+  type RoomLease,
+} from "@razzia/socket/services/leases"
 import Registry from "@razzia/socket/services/registry"
 import { createInviteCode } from "@razzia/socket/utils/game"
 import { createNickname } from "@razzia/socket/utils/nickname"
@@ -43,6 +52,8 @@ class Game {
   private readonly playerManager: PlayerManager
   private readonly round: RoundManager
   private readonly cooldown: CooldownTimer
+  private readonly persistence?: CloudGame
+  private _lease?: RoomLease
   private managerGraceTimer: NodeJS.Timeout | null = null
 
   private lastBroadcastStatus: {
@@ -58,18 +69,25 @@ class Game {
     { name: Status; data: StatusDataMap[Status] }
   >()
 
-  constructor(io: Server, managerClientId: string, quizz: Quizz) {
+  constructor(
+    io: Server,
+    managerClientId: string,
+    input: Quizz | RecoveredRoom,
+  ) {
+    const recovered = "quiz" in input ? input : undefined
+    const quizz = recovered ? recovered.quiz : (input as Quizz)
     this.io = io
-    this.gameId = uuid()
-    this.inviteCode = createInviteCode()
+    this.gameId = recovered?.id ?? uuid()
+    this.inviteCode = recovered?.invite_code ?? createInviteCode()
     this.gameMode = quizz.gameMode
     this._manager = {
-      id: "",
+      id: recovered?.manager_socket_id ?? "",
       clientId: managerClientId,
-      connected: false,
+      connected: recovered?.manager_connected ?? false,
     }
 
-    this.cooldown = new CooldownTimer(io, this.gameId)
+    this._lease = recovered?.lease
+    this.cooldown = new CooldownTimer(io, this.gameId, () => this.ownsRoom)
 
     this.playerManager = new PlayerManager({
       io,
@@ -78,6 +96,13 @@ class Game {
       getManagerId: () => this._manager.id,
       isStarted: () => this.started,
     })
+
+    const storage = cloud
+    this.persistence = storage && new CloudGame(storage, this.gameId)
+
+    if (this._lease) {
+      this.persistence?.attachLease(this._lease)
+    }
 
     this.round = new RoundManager({
       quizz,
@@ -92,9 +117,39 @@ class Game {
         this.playerStatus.clear()
         this.managerStatus = null
       },
-      onGameFinished: saveResult,
+      onGameFinished: (result) =>
+        this.persistence
+          ? this.persistence.saveReport(result)
+          : saveResult(result),
+      persistence: this.persistence,
+      savePhase:
+        storage &&
+        (async (phase, position, closesAt) => {
+          if (phase === "running") {
+            await storage.prunePlayers(this)
+          }
+
+          await storage.phase(
+            this.gameId,
+            { phase, position, closesAt },
+            this.lease,
+          )
+        }),
+      onFailure: (error) => this.fail(error),
       getSettings: () => this._settings,
+      canRun: () => this.ownsRoom,
     })
+
+    if (recovered) {
+      this._settings = recovered.settings
+      this._locked = recovered.locked
+      this.lastBroadcastStatus = recovered.runtime
+      this.managerStatus =
+        recovered.host_state_position === recovered.current_position
+          ? recovered.host_state
+          : null
+      this.playerManager.replace(recovered.members)
+    }
 
     console.log(
       `New game created: ${this.inviteCode} subject: ${quizz.subject}`,
@@ -105,8 +160,39 @@ class Game {
     return this._manager
   }
 
+  get lease() {
+    return this._lease
+  }
+
+  get ownsRoom() {
+    return !cloud || Boolean(this._lease?.active)
+  }
+
+  attachLease(lease: RoomLease) {
+    if (this._lease && this._lease.token !== lease.token) {
+      throw new LeaseLost(this.gameId)
+    }
+
+    this._lease = lease
+    this.persistence?.attachLease(lease)
+  }
+
+  async assertOwner() {
+    if (cloud) {
+      await withLease(cloud, this.lease, () => Promise.resolve())
+    }
+  }
+
+  resume(recovered: RecoveredRoom) {
+    this.round.restore(recovered)
+  }
+
   get players(): Player[] {
     return this.playerManager.getAll()
+  }
+
+  get finished(): boolean {
+    return this.round.completed
   }
 
   get started(): boolean {
@@ -132,16 +218,46 @@ class Game {
   }
 
   setLocked(locked: boolean) {
+    const previous = this._locked
     this._locked = locked
-    this.io.to(this._manager.id).emit(EVENTS.MANAGER.LOCK_UPDATED, locked)
+    const notify = () => {
+      if (this.ownsRoom) {
+        this.io.to(this._manager.id).emit(EVENTS.MANAGER.LOCK_UPDATED, locked)
+      }
+    }
+
+    if (!cloud) {
+      return notify()
+    }
+
+    return cloud.saveLobby(this).then(notify, (error: unknown) => {
+      this._locked = previous
+      throw error
+    })
   }
 
   // ── Status broadcasting ──────────────────────────────────────────────────
 
-  private broadcastStatus<T extends Status>(status: T, data: StatusDataMap[T]) {
+  private broadcastStatus<T extends Status>(
+    status: T,
+    data: StatusDataMap[T],
+    deadline: Date | null = null,
+  ) {
     const statusData = { name: status, data }
     this.lastBroadcastStatus = statusData
-    this.io.to(this.gameId).emit(EVENTS.GAME.STATUS, statusData)
+    const emit = () => {
+      if (this.ownsRoom) {
+        this.io.to(this.gameId).emit(EVENTS.GAME.STATUS, statusData)
+      }
+    }
+
+    if (this.persistence) {
+      return this.persistence
+        .broadcast(statusData, this.round.position, deadline)
+        .then(emit)
+    }
+
+    emit()
   }
 
   private sendStatus<T extends Status>(
@@ -157,33 +273,85 @@ class Game {
       this.playerStatus.set(target, statusData)
     }
 
-    this.io.to(target).emit(EVENTS.GAME.STATUS, statusData)
+    const emit = () => {
+      if (this.ownsRoom) {
+        this.io.to(target).emit(EVENTS.GAME.STATUS, statusData)
+      }
+    }
+    const player = this.playerManager.findById(target)
+
+    if (this.persistence && target === this._manager.id) {
+      let delay: number | null = null
+
+      if (status === STATUS.SHOW_RESPONSES) {
+        delay = this.settings.autoAdvance.responsesDelay
+      }
+
+      if (status === STATUS.SHOW_LEADERBOARD) {
+        delay = this.settings.autoAdvance.leaderboardDelay
+      }
+
+      const deadline =
+        this.settings.autoAdvance.enable && delay !== null
+          ? new Date(Date.now() + delay * SECOND_MS)
+          : null
+
+      return this.persistence
+        .managerState(statusData, this.round.position, deadline)
+        .then(emit)
+    }
+
+    if (this.persistence && player) {
+      return this.persistence
+        .playerState(player.clientId, statusData, this.round.position)
+        .then(emit)
+    }
+
+    emit()
   }
 
   // Player actions
 
-  join(socket: Socket, username?: string): string | null {
+  join(socket: GameSocket, username?: string) {
     if (this._locked) {
       return "errors:game.locked"
     }
 
+    const storage = cloud
+    const persist =
+      storage &&
+      ((player: Player) => storage.savePlayer(this.gameId, player, this.lease))
+
     if (this._settings.generatedUsernames) {
       const taken = this.playerManager.getAll().map((player) => player.username)
 
-      return this.playerManager.join(socket, createNickname(taken))
+      return this.playerManager.join(socket, createNickname(taken), persist)
     }
 
     if (!username) {
       return "errors:auth.usernameTooShort"
     }
 
-    return this.playerManager.join(socket, username)
+    return this.playerManager.join(socket, username, persist)
   }
 
   dispose() {
+    this.round.stop()
     this.round.clearAutoAdvance()
     this.cooldown.abort()
     this.cancelManagerGrace()
+  }
+
+  private fail(error: unknown) {
+    if (error instanceof LeaseLost) {
+      registry.releaseGame(this.gameId)
+
+      return
+    }
+
+    console.error(`Room ${this.gameId} failed:`, error)
+    this.io.to(this.gameId).emit(EVENTS.GAME.RESET, "errors:api.serverError")
+    registry.removeGame(this.gameId)
   }
 
   waitForManager(onTimeout: () => void) {
@@ -212,19 +380,27 @@ class Game {
 
   // Reconnect
 
-  reconnect(socket: Socket) {
+  reconnect(socket: GameSocket) {
     const clientId = getClientId(socket)
 
     if (this._manager.clientId === clientId) {
-      this.reconnectManager(socket)
-
-      return
+      return this.reconnectManager(socket)
     }
 
-    this.reconnectPlayer(socket)
+    return this.reconnectPlayer(socket)
   }
 
-  private reconnectManager(socket: Socket) {
+  private reconnectManager(socket: GameSocket) {
+    if (this.persistence) {
+      return this.persistence
+        .managerConnection(socket.id, true)
+        .then(() => this.applyManagerReconnect(socket))
+    }
+
+    return this.applyManagerReconnect(socket)
+  }
+
+  private applyManagerReconnect(socket: GameSocket) {
     const previousSocketId = this._manager.connected ? this._manager.id : null
 
     socket.join(this.gameId)
@@ -272,7 +448,11 @@ class Game {
     console.log(`Manager reconnected to game ${this.inviteCode}`)
   }
 
-  private reconnectPlayer(socket: Socket) {
+  private reconnectPlayer(socket: GameSocket) {
+    if (this.persistence) {
+      return this.reconnectCloudPlayer(socket, this.persistence)
+    }
+
     const clientId = getClientId(socket)
     const player = this.playerManager.findByClientId(clientId)
 
@@ -320,10 +500,51 @@ class Game {
     )
   }
 
+  private async reconnectCloudPlayer(
+    socket: GameSocket,
+    persistence: CloudGame,
+  ) {
+    const restored = await persistence.reconnect(socket)
+
+    if (!restored) {
+      socket.emit(EVENTS.GAME.RESET, "errors:game.notFound")
+
+      return
+    }
+
+    const { player, payload } = restored
+    const existing = this.playerManager.findByClientId(player.clientId)
+    const oldId = existing?.id ?? player.id
+    const previousStatus = this.playerStatus.get(oldId)
+    this.playerStatus.delete(oldId)
+
+    if (previousStatus) {
+      this.playerStatus.set(socket.id, previousStatus)
+    }
+
+    const replacement = { ...player, id: socket.id, connected: true }
+    this.playerManager.replace([
+      ...this.players.filter((entry) => entry.clientId !== player.clientId),
+      replacement,
+    ])
+    this.round.updatePlayerId(oldId, socket.id)
+    await socket.join(this.gameId)
+
+    if (oldId && oldId !== socket.id) {
+      this.io.in(oldId).disconnectSockets(true)
+    }
+
+    socket.emit(EVENTS.PLAYER.SUCCESS_RECONNECT, payload)
+    this.notifyPlayerUpdated(oldId, replacement)
+    this.playerManager.broadcastCount()
+  }
+
   // Disconnect helpers
 
   setManagerDisconnected() {
     this._manager.connected = false
+
+    return this.persistence?.managerConnection(this._manager.id, false)
   }
 
   removePlayer(socketId: string): Player | undefined {
@@ -347,6 +568,8 @@ class Game {
     if (player) {
       this.notifyPlayerUpdated(socketId, player, timedOut)
     }
+
+    return this.persistence?.disconnect(socketId)
   }
 
   private notifyPlayerUpdated(
@@ -365,7 +588,7 @@ class Game {
     this.cooldown.abort()
   }
 
-  async start(socket: Socket) {
+  async start(socket: GameSocket) {
     if (!this.started) {
       const away = this.playerManager.getAll().filter((p) => !p.connected)
 
@@ -374,11 +597,15 @@ class Game {
       }
     }
 
-    await this.round.start(socket)
+    try {
+      await this.round.start(socket)
+    } catch (error) {
+      this.fail(error)
+    }
   }
 
-  selectAnswer(socket: Socket, answerIds: number[]) {
-    this.round.selectAnswer(socket, answerIds)
+  selectAnswer(socket: GameSocket, answerIds: number[], roundId?: string) {
+    return this.round.selectAnswer(socket, answerIds, roundId)
   }
 
   advance() {

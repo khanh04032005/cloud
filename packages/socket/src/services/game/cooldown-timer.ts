@@ -5,50 +5,78 @@ import { SECOND_MS } from "@razzia/socket/utils/sleep"
 export class CooldownTimer {
   private readonly io: Server
   private readonly gameId: string
-  private active = false
+  private readonly canRun: () => boolean
+  private timer: ReturnType<typeof setInterval> | null = null
+  private aborted = false
+  private complete: (() => void) | null = null
 
-  constructor(io: Server, gameId: string) {
+  constructor(io: Server, gameId: string, canRun: () => boolean = () => true) {
     this.io = io
     this.gameId = gameId
+    this.canRun = canRun
   }
 
   start(seconds: number): Promise<void> {
-    if (this.active) {
+    return this.until(
+      seconds === NO_TIME_LIMIT
+        ? null
+        : new Date(Date.now() + seconds * SECOND_MS),
+    )
+  }
+
+  until(deadline: Date | null): Promise<void> {
+    if (this.complete) {
       return Promise.resolve()
     }
 
-    this.active = true
-
-    if (seconds === NO_TIME_LIMIT) {
-      return new Promise<void>((resolve) => {
-        const interval = setInterval(() => {
-          if (!this.active) {
-            clearInterval(interval)
-            resolve()
-          }
-        }, SECOND_MS)
-      })
-    }
-
-    let count = seconds - 1
-
     return new Promise<void>((resolve) => {
-      const interval = setInterval(() => {
-        if (!this.active || count <= 0) {
-          this.active = false
-          clearInterval(interval)
-          resolve()
+      this.complete = resolve
+      this.aborted = false
+      let previous = -1
+      const tick = () => {
+        if (
+          this.aborted ||
+          !this.canRun() ||
+          (deadline && Date.now() >= deadline.getTime())
+        ) {
+          this.finish()
 
           return
         }
 
-        this.io.to(this.gameId).emit(EVENTS.GAME.COOLDOWN, count)
-        count -= 1
-      }, SECOND_MS)
+        if (!deadline) {
+          return
+        }
+
+        const remaining = Math.ceil(
+          (deadline.getTime() - Date.now()) / SECOND_MS,
+        )
+
+        if (remaining !== previous) {
+          previous = remaining
+          this.io.to(this.gameId).emit(EVENTS.GAME.COOLDOWN, remaining)
+        }
+      }
+      this.timer = setInterval(tick, Math.min(SECOND_MS, 1000))
+
+      if (deadline && deadline.getTime() <= Date.now()) {
+        this.finish()
+      }
     })
   }
 
   abort() {
-    this.active &&= false
+    this.aborted = true
+  }
+
+  private finish() {
+    if (this.timer) {
+      clearInterval(this.timer)
+    }
+
+    this.timer = null
+    const resolve = this.complete
+    this.complete = null
+    resolve?.()
   }
 }
