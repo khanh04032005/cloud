@@ -1,0 +1,51 @@
+{
+  "title": "Razzia — đo tải vai D",
+  "uid": "razzia-role-d",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "tags": ["razzia", "role-d"],
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "type": "text",
+      "title": "Cách đọc",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "Metric Kafka lấy từ process của vai B (`:9101` publisher, `:9102` score, `:9103` stats). k6 không tự vào Prometheus: lưu `summary.json` của từng lần chạy. CPU máy phát tải xem ở CloudWatch của EC2 đó, không cộng vào CPU pod."
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Kafka consumer lag",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "razzia_kafka_consumer_lag", "refId": "A" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Event điểm và bản trùng",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(razzia_score_events_total[1m])", "legendFormat": "score/s", "refId": "A" },
+        { "expr": "rate(razzia_score_duplicates_total[1m])", "legendFormat": "duplicate/s", "refId": "B" },
+        { "expr": "rate(razzia_outbox_published_total[1m])", "legendFormat": "outbox/s", "refId": "C" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Stats worker",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(razzia_stats_events_total[1m])", "legendFormat": "stats/s", "refId": "A" },
+        { "expr": "rate(razzia_stats_db_prechecks_total[1m])", "legendFormat": "db precheck/s", "refId": "B" },
+        { "expr": "rate(razzia_stats_bloom_false_positive_total[1m])", "legendFormat": "bloom fp/s", "refId": "C" }
+      ]
+    }
+  ]
+}
