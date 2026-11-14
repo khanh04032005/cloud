@@ -1,6 +1,11 @@
 /node_modules
+**/node_modules
 /config
 .env
 .secrets
 release.json
 /coverage
+/.corepack
+/.pnpm-store
+/.docker-config
+/packages/streaming/.replay-baseline.json

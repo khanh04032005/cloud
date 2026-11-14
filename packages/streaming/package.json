@@ -1,0 +1,19 @@
+{
+  "name": "@razzia/streaming",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start:publisher": "node src/publisher.mjs",
+    "start:score": "node src/score-worker.mjs",
+    "start:stats": "node src/stats-worker.mjs",
+    "test": "node --test src/*.test.mjs"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "pg": "^8.16.3",
+    "redis": "^5.9.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.13"
+  }
+}
