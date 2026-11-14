@@ -26,6 +26,7 @@ interface Props {
 
 const Answers = ({
   data: {
+    roundId,
     question,
     answers,
     media,
@@ -67,6 +68,7 @@ const Answers = ({
 
     socket.emit(EVENTS.PLAYER.SELECTED_ANSWER, {
       gameId,
+      roundId,
       data: {
         answerKeys,
       },

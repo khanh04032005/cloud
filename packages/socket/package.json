@@ -11,11 +11,14 @@
     "@hono/node-server": "^2.1.5",
     "@hono/zod-validator": "^0.9.1",
     "@razzia/common": "workspace:*",
+    "@socket.io/redis-adapter": "^8.3.0",
     "dayjs": "^1.11.23",
     "file-type": "^22.2.0",
     "hono": "catalog:",
     "http-status-codes": "catalog:",
     "nanoid": "^6.0.2",
+    "pg": "^8.23.1",
+    "redis": "^5.12.1",
     "socket.io": "catalog:",
     "typescript": "catalog:",
     "uuid": "catalog:",
@@ -23,6 +26,7 @@
   },
   "devDependencies": {
     "@types/node": "catalog:",
+    "@types/pg": "^8.23.1",
     "rolldown": "^1.2.15",
     "socket.io-client": "catalog:",
     "tsx": "^4.23.15"

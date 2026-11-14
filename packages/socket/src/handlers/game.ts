@@ -1,12 +1,47 @@
 import { EVENTS } from "@razzia/common/constants"
-import type { SocketContext } from "@razzia/socket/handlers/types"
+import type { GameSettings } from "@razzia/common/types/game"
+import type {
+  ClientToServerEvents,
+  Server,
+  SocketData,
+} from "@razzia/common/types/game/socket"
+import type { GameSocket, SocketContext } from "@razzia/socket/handlers/types"
 import { verifyJoinTicket } from "@razzia/socket/services/auth"
+import { cloud } from "@razzia/socket/services/cloud"
+import { CloudGame } from "@razzia/socket/services/cloud-game"
+import { ensureRoom } from "@razzia/socket/services/coordinator"
+import { metrics } from "@razzia/socket/services/metrics"
 import Game from "@razzia/socket/services/game"
+import { getIo } from "@razzia/socket/services/io"
 import Registry from "@razzia/socket/services/registry"
 import { withManagerGame, withPlayerGame } from "@razzia/socket/utils/game"
 import { getClientId } from "@razzia/socket/utils/socket"
 
-export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
+type Event = Exclude<keyof ClientToServerEvents, "disconnect">
+type Handler<E extends Event> = (
+  ..._args: Parameters<ClientToServerEvents[E]>
+) => unknown
+type Register = <E extends Event>(_event: E, _handler: Handler<E>) => void
+
+const checkJoinTicket = async (ticket: string, socket: GameSocket) => {
+  const claims = await verifyJoinTicket(ticket).catch(() => null)
+
+  if (!claims) {
+    socket.emit(EVENTS.GAME.RESET, "errors:auth.joinTicketInvalid")
+
+    return null
+  }
+
+  if (claims.sub !== getClientId(socket)) {
+    socket.emit(EVENTS.GAME.RESET, "errors:auth.unauthorized")
+
+    return null
+  }
+
+  return claims
+}
+
+const bindGameHandlers = (io: Server, socket: GameSocket, on: Register) => {
   const registry = Registry.getInstance()
   const clientId = getClientId(socket)
 
@@ -19,8 +54,8 @@ export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
     registry.removeGame(game.gameId)
   }
 
-  const handleManagerLeave = (game: Game) => {
-    game.setManagerDisconnected()
+  const handleManagerLeave = async (game: Game) => {
+    await game.setManagerDisconnected()
     registry.markGameAsEmpty(game)
 
     if (!game.started) {
@@ -28,8 +63,8 @@ export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
     }
   }
 
-  const handleManagerDisconnect = (game: Game) => {
-    game.setManagerDisconnected()
+  const handleManagerDisconnect = async (game: Game) => {
+    await game.setManagerDisconnected()
     registry.markGameAsEmpty(game)
 
     if (!game.started) {
@@ -51,90 +86,83 @@ export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
     game.setPlayerDisconnected(socket.id)
   }
 
-  socket.on(EVENTS.PLAYER.RECONNECT, ({ gameId }) => {
-    const game = registry.getPlayerGame(gameId, clientId)
+  on(EVENTS.PLAYER.RECONNECT, ({ gameId }) => {
+    const game = cloud
+      ? registry.getGameById(gameId)
+      : registry.getPlayerGame(gameId, clientId)
 
     if (game) {
-      game.reconnect(socket)
-
-      return
+      return game.reconnect(socket)
     }
 
     socket.emit(EVENTS.GAME.RESET, "errors:game.notFound")
   })
 
-  socket.on(EVENTS.MANAGER.RECONNECT, ({ gameId }) => {
+  on(EVENTS.MANAGER.RECONNECT, ({ gameId }) => {
     const game = registry.getManagerGame(gameId, clientId)
 
     if (game) {
-      game.reconnect(socket)
-
-      return
+      return game.reconnect(socket)
     }
 
     socket.emit(EVENTS.GAME.RESET, "errors:game.expired")
   })
 
-  socket.on(EVENTS.PLAYER.LOGIN, ({ ticket }) => {
-    verifyJoinTicket(ticket)
-      .then((claims) => {
-        if (claims.sub !== clientId) {
-          socket.emit(EVENTS.GAME.RESET, "errors:auth.unauthorized")
+  on(EVENTS.PLAYER.LOGIN, async ({ ticket }) => {
+    const claims = await checkJoinTicket(ticket, socket)
 
-          return
-        }
+    if (!claims) {
+      return
+    }
 
-        const game = registry.getGameById(claims.gameId)
+    const game = registry.getGameById(claims.gameId)
 
-        if (!game) {
-          socket.emit(EVENTS.GAME.RESET, "errors:game.notFound")
+    if (!game) {
+      socket.emit(EVENTS.GAME.RESET, "errors:game.notFound")
 
-          return
-        }
+      return
+    }
 
-        const error = game.join(socket, claims.username)
+    const error = await game.join(socket, claims.username)
 
-        if (error) {
-          socket.emit(EVENTS.GAME.RESET, error)
-        }
-      })
-      .catch(() => {
-        socket.emit(EVENTS.GAME.RESET, "errors:auth.joinTicketInvalid")
-      })
+    if (error) {
+      socket.emit(EVENTS.GAME.RESET, error)
+    }
   })
 
-  socket.on(EVENTS.MANAGER.KICK_PLAYER, ({ gameId, playerId }) =>
+  on(EVENTS.MANAGER.KICK_PLAYER, ({ gameId, playerId }) =>
     withManagerGame(gameId, socket, (game) => game.kickPlayer(playerId)),
   )
 
-  socket.on(EVENTS.MANAGER.SET_LOCK, ({ gameId, locked }) =>
+  on(EVENTS.MANAGER.SET_LOCK, ({ gameId, locked }) =>
     withManagerGame(gameId, socket, (game) => game.setLocked(locked)),
   )
 
-  socket.on(EVENTS.MANAGER.START_GAME, ({ gameId }) =>
+  on(EVENTS.MANAGER.START_GAME, ({ gameId }) =>
     withManagerGame(gameId, socket, (game) => game.start(socket)),
   )
 
-  socket.on(EVENTS.PLAYER.SELECTED_ANSWER, ({ gameId, data }) =>
+  on(EVENTS.PLAYER.SELECTED_ANSWER, ({ gameId, data, roundId }) =>
     withPlayerGame(gameId, socket, (game) =>
-      game.selectAnswer(socket, data.answerKeys),
+      game.selectAnswer(socket, data.answerKeys, roundId),
     ),
   )
 
-  socket.on(EVENTS.MANAGER.ADVANCE, ({ gameId }) =>
+  on(EVENTS.MANAGER.ADVANCE, ({ gameId }) =>
     withManagerGame(gameId, socket, (game) => game.advance()),
   )
 
-  socket.on(EVENTS.MANAGER.LEAVE, ({ gameId }) => {
+  on(EVENTS.MANAGER.LEAVE, ({ gameId }) => {
     const game = registry.getManagerGame(gameId, clientId)
 
     if (game) {
       console.log(`Manager left game ${game.inviteCode}`)
-      handleManagerLeave(game)
+
+      return handleManagerLeave(game)
     }
   })
 
-  socket.on(EVENTS.PLAYER.LEAVE, ({ gameId }) => {
+  on(EVENTS.PLAYER.LEAVE, ({ gameId }) => {
     const game = registry.getPlayerGame(gameId, clientId)
 
     if (game) {
@@ -142,22 +170,326 @@ export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
     }
   })
 
-  socket.on("disconnect", (reason) => {
+  return (reason: string, gameId?: string) => {
     console.log(`A user disconnected : ${socket.id}`)
 
-    const managerGame = registry.getGameByManagerSocketId(socket.id)
+    const managerGame = gameId
+      ? registry.getGameById(gameId)
+      : registry.getGameByManagerSocketId(socket.id)
 
-    if (managerGame) {
+    if (managerGame?.manager.id === socket.id) {
       console.log(`Manager disconnected from game ${managerGame.inviteCode}`)
-      handleManagerDisconnect(managerGame)
 
-      return
+      return handleManagerDisconnect(managerGame)
     }
 
-    const playerGame = registry.getGameByPlayerSocketId(socket.id)
+    const playerGame = gameId
+      ? managerGame
+      : registry.getGameByPlayerSocketId(socket.id)
 
-    if (playerGame) {
-      playerGame.setPlayerDisconnected(socket.id, reason === "ping timeout")
+    if (playerGame?.players.some(({ id }) => id === socket.id)) {
+      return playerGame.setPlayerDisconnected(
+        socket.id,
+        reason === "ping timeout",
+      )
+    }
+  }
+}
+
+type SocketCommand = {
+  gameId: string
+  socketId: string
+  data: SocketData
+} & (
+  { event: Event; args: unknown[] } | { event: "disconnect"; reason: string }
+)
+
+type Command =
+  | SocketCommand
+  | {
+      event: "settings"
+      gameId: string
+      clientId: string
+      settings: Partial<GameSettings>
+    }
+
+type Reply =
+  | { joined: boolean }
+  | { settings: GameSettings }
+  | "missing"
+  | "started"
+  | "failed"
+const commands = new Map<string, Promise<unknown>>()
+const rpc = "razzia:room-command"
+
+const runCommand = (io: Server, command: Command, localSocket?: GameSocket) => {
+  const previous = commands.get(command.gameId) ?? Promise.resolve()
+  const work = previous
+    .then(async (): Promise<Reply> => {
+      const game = Registry.getInstance().getGameById(command.gameId)
+
+      if (!game) {
+        return "missing"
+      }
+
+      await game.assertOwner()
+
+      if (command.event === "settings") {
+        if (game.manager.clientId !== command.clientId) {
+          return "missing"
+        }
+
+        const previousSettings = game.settings
+
+        if (!game.updateSettings(command.settings)) {
+          return "started"
+        }
+
+        try {
+          await cloud?.saveLobby(game)
+        } catch (error) {
+          game.updateSettings(previousSettings)
+          throw error
+        }
+
+        return { settings: game.settings }
+      }
+
+      const { socketId, data } = command
+      const socket: GameSocket = localSocket ?? {
+        id: socketId,
+        data,
+        join: (room) => io.in(socketId).socketsJoin(room),
+        to: (room) => io.to(room).except(socketId),
+        emit: (event, ...args) => io.to(socketId).emit(event, ...args),
+      }
+      const callbacks = new Map<Event, (..._args: never[]) => unknown>()
+      const disconnect = bindGameHandlers(io, socket, (event, handler) => {
+        callbacks.set(event, handler)
+      })
+
+      if (command.event === "disconnect") {
+        await disconnect(command.reason, command.gameId)
+      } else {
+        await callbacks.get(command.event)?.(...(command.args as never[]))
+      }
+
+      if (
+        command.event === EVENTS.MANAGER.KICK_PLAYER ||
+        command.event === EVENTS.PLAYER.LEAVE
+      ) {
+        await cloud?.prunePlayers(game)
+      }
+
+      return {
+        joined:
+          game.manager.id === socketId ||
+          game.players.some(({ id }) => id === socketId),
+      }
+    })
+    .catch((error: unknown): Reply => {
+      console.error(`Room command ${command.event} failed:`, error)
+
+      return "failed"
+    })
+  commands.set(command.gameId, work)
+  void work.then(() => {
+    if (commands.get(command.gameId) === work) {
+      commands.delete(command.gameId)
     }
   })
+
+  return work
+}
+
+const routeCommand = async (
+  io: Server,
+  command: Command,
+  socket?: GameSocket,
+): Promise<Reply> => {
+  let owner = await cloud?.owner(command.gameId)
+
+  if (!owner || owner === cloud?.nodeId) {
+    await ensureRoom(command.gameId)
+    owner = await cloud?.owner(command.gameId)
+  }
+
+  if (!owner) {
+    return "missing"
+  }
+
+  if (owner === cloud?.nodeId) {
+    return runCommand(io, command, socket)
+  }
+
+  const replies = (await io.serverSideEmitWithAck(
+    rpc,
+    owner,
+    command,
+  )) as Array<Reply | null>
+
+  return replies.find((reply) => reply !== null) ?? "missing"
+}
+
+export const installRoomRouting = (io: Server) => {
+  io.on(
+    rpc,
+    (owner: string, command: Command, ack: (_result: Reply | null) => void) => {
+      if (owner !== cloud?.nodeId) {
+        ack(null)
+      } else {
+        void ensureRoom(command.gameId)
+          .then(() => runCommand(io, command))
+          .then(ack)
+          .catch((error: unknown) => {
+            console.error("Room recovery failed:", error)
+            ack("failed")
+          })
+      }
+    },
+  )
+}
+
+export const updateCloudRoomSettings = (
+  gameId: string,
+  clientId: string,
+  settings: Partial<GameSettings>,
+) => routeCommand(getIo(), { event: "settings", gameId, clientId, settings })
+
+const routeSocketCommand = (
+  io: Server,
+  command: SocketCommand,
+  socket: GameSocket,
+) =>
+  routeCommand(io, command, socket).catch((error: unknown): Reply => {
+    if (command.event === EVENTS.PLAYER.RECONNECT) {
+      return "missing"
+    }
+
+    throw error
+  })
+
+export const gameSocketHandlers = ({ io, socket }: SocketContext) => {
+  // Socket.IO's reserved-event overload cannot narrow a generic application event.
+  const register = socket.on.bind(socket) as Register
+
+  if (!cloud) {
+    const disconnect = bindGameHandlers(io, socket, register)
+    socket.on("disconnect", (reason) => disconnect(reason))
+
+    return
+  }
+
+  const rooms = new Set<string>()
+  const storage = cloud
+  let pending = Promise.resolve()
+  const enqueue = (action: () => Promise<void>) => {
+    pending = pending.then(action).catch((error: unknown) => {
+      console.error("Could not route room command:", error)
+      socket.emit(EVENTS.GAME.ERROR_MESSAGE, "errors:api.serverError")
+    })
+  }
+  bindGameHandlers(io, socket, (event) => {
+    register(
+      event,
+      (...args: Parameters<ClientToServerEvents[typeof event]>) => {
+        const receivedAt = performance.now()
+        enqueue(async () => {
+          try {
+            const [message] = args
+            const gameId =
+              "ticket" in message
+                ? (await checkJoinTicket(message.ticket, socket))?.gameId
+                : message.gameId
+
+            if (!gameId) {
+              return
+            }
+
+            let reply = await routeSocketCommand(
+              io,
+              { gameId, event, args, socketId: socket.id, data: socket.data },
+              socket,
+            )
+
+            if (reply === "missing" && event === EVENTS.PLAYER.RECONNECT) {
+              const restored = await new CloudGame(storage, gameId).reconnect(
+                socket,
+              )
+
+              if (restored) {
+                await socket.join(gameId)
+
+                if (restored.player.id && restored.player.id !== socket.id) {
+                  io.in(restored.player.id).disconnectSockets(true)
+                }
+
+                socket.emit(EVENTS.PLAYER.SUCCESS_RECONNECT, restored.payload)
+                reply = { joined: true }
+              }
+            }
+
+            if (reply === "missing" && event === EVENTS.MANAGER.RECONNECT) {
+              const snapshot = await new CloudGame(
+                storage,
+                gameId,
+              ).finishedHost(socket)
+
+              if (snapshot) {
+                await socket.join(gameId)
+                socket.emit(EVENTS.MANAGER.SUCCESS_RECONNECT, snapshot)
+                reply = { joined: true }
+              }
+            }
+
+            if (reply === "failed") {
+              socket.emit(EVENTS.GAME.ERROR_MESSAGE, "errors:api.serverError")
+            }
+
+            if (reply === "missing") {
+              if (event === EVENTS.MANAGER.RECONNECT) {
+                socket.emit(EVENTS.GAME.RESET, "errors:game.expired")
+              } else if (
+                event === EVENTS.PLAYER.RECONNECT ||
+                event === EVENTS.PLAYER.LOGIN
+              ) {
+                socket.emit(EVENTS.GAME.RESET, "errors:game.notFound")
+              } else {
+                socket.emit(EVENTS.GAME.ERROR_MESSAGE, "errors:game.notFound")
+              }
+            }
+
+            if (
+              typeof reply === "object" &&
+              "joined" in reply &&
+              reply.joined
+            ) {
+              rooms.add(gameId)
+            } else {
+              rooms.delete(gameId)
+            }
+          } finally {
+            if (event === EVENTS.PLAYER.SELECTED_ANSWER) {
+              metrics.observeAck((performance.now() - receivedAt) / 1000)
+            }
+          }
+        })
+      },
+    )
+  })
+  socket.on("disconnect", (reason) =>
+    enqueue(async () => {
+      await Promise.all(
+        [...rooms].map((gameId) =>
+          routeCommand(io, {
+            gameId,
+            event: "disconnect",
+            reason,
+            socketId: socket.id,
+            data: socket.data,
+          }),
+        ),
+      )
+    }),
+  )
 }

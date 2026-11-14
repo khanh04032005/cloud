@@ -29,6 +29,7 @@ const MAX_AUTH_RETRIES = 2
 
 export const socketClient: TypedSocket = io("/", {
   path: "/ws",
+  transports: ["websocket"],
   autoConnect: false,
   reconnection: true,
   reconnectionAttempts: Infinity,

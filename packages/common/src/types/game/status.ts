@@ -34,6 +34,7 @@ export interface CommonStatusDataMap {
     cooldown: number
   }
   SELECT_ANSWER: {
+    roundId?: string
     question: string
     answers: string[]
     media?: QuestionMedia
@@ -54,7 +55,7 @@ export interface CommonStatusDataMap {
   WAIT: { text: string }
   FINISHED: {
     subject: string
-    top: Array<Pick<Player, "username" | "points">>
+    top: Array<Pick<Player, "username" | "points" | "rank">>
     rank?: number
   }
   SUMMARY: { subject: string; totalPlayers: number; totalQuestions: number }

@@ -37,6 +37,7 @@ export interface Player {
   username: string
   points: number
   streak: number
+  rank?: number
 }
 
 export interface Answer {

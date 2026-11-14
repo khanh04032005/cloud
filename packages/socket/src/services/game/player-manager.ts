@@ -1,7 +1,8 @@
 import { EVENTS } from "@razzia/common/constants"
 import type { Player, QuizzMode } from "@razzia/common/types/game"
-import type { Server, Socket } from "@razzia/common/types/game/socket"
+import type { Server } from "@razzia/common/types/game/socket"
 import { usernameValidator } from "@razzia/common/validators/auth"
+import type { GameSocket } from "@razzia/socket/handlers/types"
 import { getClientId } from "@razzia/socket/utils/socket"
 
 export interface PlayerManagerOptions {
@@ -34,7 +35,11 @@ export class PlayerManager {
     this.isStarted = isStarted
   }
 
-  join(socket: Socket, username: string): string | null {
+  join(
+    socket: GameSocket,
+    username: string,
+    persist?: (_player: Player) => Promise<void>,
+  ) {
     const clientId = getClientId(socket)
 
     if (this.findByClientId(clientId)) {
@@ -47,8 +52,6 @@ export class PlayerManager {
       return result.error.issues[0].message
     }
 
-    socket.join(this.gameId)
-
     const player: Player = {
       id: socket.id,
       clientId,
@@ -58,16 +61,21 @@ export class PlayerManager {
       streak: 0,
     }
 
-    this.players.push(player)
-    this.io.to(this.getManagerId()).emit(EVENTS.MANAGER.NEW_PLAYER, player)
-    this.broadcastCount()
-    socket.emit(EVENTS.GAME.SUCCESS_JOIN, {
-      gameId: this.gameId,
-      username,
-      gameMode: this.gameMode,
-    })
+    const join = () => {
+      socket.join(this.gameId)
+      this.players.push(player)
+      this.io.to(this.getManagerId()).emit(EVENTS.MANAGER.NEW_PLAYER, player)
+      this.broadcastCount()
+      socket.emit(EVENTS.GAME.SUCCESS_JOIN, {
+        gameId: this.gameId,
+        username,
+        gameMode: this.gameMode,
+      })
 
-    return null
+      return null
+    }
+
+    return persist ? persist(player).then(join) : join()
   }
 
   kick(playerId: string): boolean {
