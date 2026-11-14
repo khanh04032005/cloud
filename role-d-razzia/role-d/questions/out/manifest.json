@@ -1,0 +1,67 @@
+{
+  "license": "CC BY-SA 4.0",
+  "source": "https://github.com/uberspot/OpenTriviaQA",
+  "sourceCommit": "dcc1cdf36c2985ed5c849d1f2265c5041ffcdfb9",
+  "seed": 20261026,
+  "categories": [
+    {
+      "category": "geography",
+      "sha256": "aab2381417cb2238b35677a0708113997f3dd644f4ebe61fe13ae75f05e220d8",
+      "parsed": 842,
+      "kept": 840,
+      "skipped": {
+        "tooFewChoices": 0,
+        "tooManyChoices": 0,
+        "empty": 0,
+        "correctMissing": 0,
+        "correctAmbiguous": 0,
+        "duplicateChoice": 2
+      }
+    },
+    {
+      "category": "history",
+      "sha256": "4fe547762a58805bd98c4c3fa224e7db58a0b0f86152b0716c84452227a7ef1a",
+      "parsed": 1645,
+      "kept": 1643,
+      "skipped": {
+        "tooFewChoices": 0,
+        "tooManyChoices": 2,
+        "empty": 0,
+        "correctMissing": 0,
+        "correctAmbiguous": 0,
+        "duplicateChoice": 0
+      }
+    },
+    {
+      "category": "science-technology",
+      "sha256": "5f65f06f12aaa6a439880118ef6e43e24fa7bb03c001fd1cf87518bf096ec897",
+      "parsed": 2486,
+      "kept": 2483,
+      "skipped": {
+        "tooFewChoices": 0,
+        "tooManyChoices": 0,
+        "empty": 1,
+        "correctMissing": 0,
+        "correctAmbiguous": 0,
+        "duplicateChoice": 2
+      }
+    },
+    {
+      "category": "general",
+      "sha256": "74fbb5192597b19be54fc98c2431d1834a4e8db13e4217dcca8d3d12cac30f7a",
+      "parsed": 3290,
+      "kept": 3287,
+      "skipped": {
+        "tooFewChoices": 0,
+        "tooManyChoices": 0,
+        "empty": 3,
+        "correctMissing": 0,
+        "correctAmbiguous": 0,
+        "duplicateChoice": 0
+      }
+    }
+  ],
+  "bankQuestions": 120,
+  "loadQuestions": 8,
+  "note": "Tập đo tải bỏ category để mỗi câu đều có màn leaderboard. maxPoints = 1 chỉ là trần điểm của Razzia gốc; điểm theo thời gian vẫn còn cho đến khi vai A sửa scorer."
+}

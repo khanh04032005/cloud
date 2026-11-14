@@ -1,0 +1,13 @@
+experiment,players,rooms,replicas,answer_mode,p50_ack_ms,p95_ack_ms,answers_accepted,answers_per_sec,error_rate,kafka_lag_max,reconnect_p95_ms,duplicate_acks,score_mismatches,generator_cpu_max,app_cpu_max,duration_s,cost_usd,notes
+1-baseline,100,1,1,random,,,,,,,,,,,,
+1-baseline,500,1,1,random,,,,,,,,,,,,
+1-baseline,1000,1,1,random,,,,,,,,,,,,
+2-one-room,500,1,1,random,,,,,,,,,,,,
+2-many-rooms,500,10,1,random,,,,,,,,,,,,
+3-burst,500,1,1,end,,,,,,,,,,,,
+4-fixed,500,1,2,random,,,,,,,,,,,,
+4-autoscale,500,1,hpa,random,,,,,,,,,,,,
+5-duplicate,100,1,1,immediate,,,,,,,,,,,,
+5-replay,100,1,1,immediate,,,,,,,,,,,,
+6-kill-pod,100,1,2,random,,,,,,,,,,,,
+6-drain-node,100,1,2,random,,,,,,,,,,,,
