@@ -1,6 +1,6 @@
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3"
 import pg from "pg"
-import { buildImportPlan, isUniqueViolation } from "./logic.mjs"
+import { applyImportPlan, buildImportPlan } from "./logic.mjs"
 
 const s3 = new S3Client({})
 let pool
@@ -14,7 +14,8 @@ function getPool() {
     pool = new pg.Pool({
       connectionString: process.env.DATABASE_URL,
       max: 1,
-      ssl: process.env.PGSSL === "disable" ? false : { rejectUnauthorized: true },
+      ssl:
+        process.env.PGSSL === "disable" ? false : { rejectUnauthorized: true },
     })
   }
 
@@ -22,7 +23,9 @@ function getPool() {
 }
 
 async function readBody(bucket, key) {
-  const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+  const response = await s3.send(
+    new GetObjectCommand({ Bucket: bucket, Key: key }),
+  )
   const bytes = await response.Body.transformToByteArray()
 
   return {
@@ -45,10 +48,17 @@ export async function handler(event) {
     }
 
     const object = await readBody(bucket, key)
+    const etag =
+      object.etag.length > 0
+        ? object.etag
+        : (record.s3.object.eTag?.replaceAll('"', "") ?? "")
+    if (etag.length === 0) {
+      throw new Error(`Missing S3 ETag for ${key}`)
+    }
     const plan = buildImportPlan({
       bucket,
       key,
-      etag: object.etag || record.s3.object.eTag?.replaceAll('"', "") || "missing-etag",
+      etag,
       body: object.body,
       license,
     })
@@ -61,29 +71,13 @@ export async function handler(event) {
     const client = await getPool().connect()
 
     try {
-      await client.query("BEGIN")
-
-      for (const statement of plan.statements) {
-        await client.query(statement.text, statement.values)
-      }
-
-      await client.query("COMMIT")
+      const imported = await applyImportPlan(client, plan)
       results.push({
         key,
-        status: "imported",
-        questionSetId: plan.setId,
+        ...imported,
         questions: plan.questionCount,
         sha256: plan.sha256,
       })
-    } catch (error) {
-      await client.query("ROLLBACK")
-
-      if (isUniqueViolation(error)) {
-        results.push({ key, status: "duplicate", etag: object.etag })
-        continue
-      }
-
-      throw error
     } finally {
       client.release()
     }

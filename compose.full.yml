@@ -1,0 +1,145 @@
+# Toàn bộ hệ thống ở local, dùng đúng các image sẽ chạy trên EKS.
+#   docker compose -f compose.full.yml up --build
+#   mở http://localhost:8080 (người chơi), http://localhost:8080/manager (host, mật khẩu admin)
+#
+# Thử chuyển lease: docker compose -f compose.full.yml stop socket-1 (giữa câu hỏi)
+# Xem điểm:        docker compose -f compose.full.yml exec postgres psql -U razzia -c 'SELECT * FROM results'
+# Dọn sạch:        docker compose -f compose.full.yml down -v
+# Cổng host đổi được: APP_PORT (8080), PG_PORT (15432), REDIS_PORT (16379)
+
+name: razzia-full
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://razzia:razzia@postgres:5432/razzia
+  REDIS_URL: redis://redis:6379
+  KAFKA_BROKERS: kafka:9092
+  KAFKA_TOPIC: answers
+  JWT_SECRET: local-dev-secret-at-least-32-characters-long
+  MANAGER_PASSWORD: admin
+
+x-socket: &socket
+  build: { context: ., target: socket }
+  image: razzia-socket:local
+  environment: *app-env
+  depends_on:
+    migrate: { condition: service_completed_successfully }
+    redis: { condition: service_healthy }
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:3001/health/ready"]
+    interval: 5s
+    retries: 12
+  restart: unless-stopped
+
+x-worker: &worker
+  build: { context: ., target: worker }
+  image: razzia-worker:local
+  environment: *app-env
+  depends_on:
+    migrate: { condition: service_completed_successfully }
+    kafka-init: { condition: service_completed_successfully }
+    redis: { condition: service_healthy }
+  restart: unless-stopped
+
+services:
+  # ---------- Tầng dữ liệu (trên AWS: RDS, ElastiCache, EC2 Kafka) ----------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: razzia
+      POSTGRES_USER: razzia
+      POSTGRES_PASSWORD: razzia
+    ports: ["${PG_PORT:-15432}:5432"] # tránh đụng Postgres có sẵn trên máy
+    volumes: [full_pg:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "razzia"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports: ["${REDIS_PORT:-16379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+  # 1 node KRaft, cấu hình giống packages/streaming/kafka/server.properties.example,
+  # chỉ khác advertised listener là tên service "kafka" thay cho IP private của EC2.
+  kafka:
+    image: apache/kafka:3.9.1
+    # Không mở cổng ra host: listener quảng bá tên "kafka", chỉ dùng được trong mạng compose.
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      retries: 30
+
+  # ---------- Job chạy một lần ----------
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka: { condition: service_healthy }
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command:
+      [
+        "--bootstrap-server", "kafka:9092", "--create", "--if-not-exists",
+        "--topic", "answers", "--partitions", "3", "--replication-factor", "1",
+      ]
+
+  migrate: # trên EKS: Helm hook Job, cùng image
+    build: { context: ., target: migrate }
+    image: razzia-migrate:local
+    environment:
+      DATABASE_URL: postgres://razzia:razzia@postgres:5432/razzia
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # ---------- App ----------
+  socket-1: *socket
+  socket-2: *socket # 2 replica để thử Redis adapter + lease của A
+
+  web:
+    build: { context: ., target: web }
+    image: razzia-web:local
+
+  proxy: # đóng vai ALB
+    image: nginx:1.29-alpine
+    ports: ["${APP_PORT:-8080}:80"]
+    volumes: ["./deploy/local-alb.conf:/etc/nginx/conf.d/default.conf:ro"]
+    depends_on:
+      socket-1: { condition: service_healthy }
+      socket-2: { condition: service_healthy }
+      web: { condition: service_started }
+
+  # ---------- Streaming của B ----------
+  publisher:
+    <<: *worker
+    command: ["node", "src/publisher.mjs"]
+    ports: ["9101:9101"]
+
+  score:
+    <<: *worker
+    command: ["node", "src/score-worker.mjs"]
+    ports: ["9102:9102"]
+
+  stats:
+    <<: *worker
+    command: ["node", "src/stats-worker.mjs"]
+    ports: ["9103:9103"]
+
+volumes:
+  full_pg:

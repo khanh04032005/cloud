@@ -192,7 +192,7 @@ export class RoomCoordinator {
   private load(lease: RoomLease, liveIds: string[]) {
     return withLease(
       this.storage,
-      lease,
+      { gameId: lease.gameId, lease },
       async (client): Promise<RecoveredRoom | undefined> => {
         const { rows: rooms } = await client.query<
           StoredRoom & { game_mode: RecoveredRoom["quiz"]["gameMode"] }

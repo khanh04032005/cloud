@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto"
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest"
 import { Cloud } from "@razzia/socket/services/cloud"
 import {
+  RoomLease,
   acquireLease,
-  acquireLocked,
   renewLease,
   releaseLease,
   withLease,
@@ -12,6 +12,7 @@ import {
 import { CloudGame } from "@razzia/socket/services/cloud-game"
 import { applyScoreFixture } from "@razzia/socket/test/score-fixture"
 import type { GameSocket } from "@razzia/socket/handlers/types"
+import { ownedRoom } from "@razzia/socket/test/owned-room"
 
 const database = process.env.CLOUD_TEST_DATABASE_URL
 const redis = process.env.CLOUD_TEST_REDIS_URL
@@ -75,59 +76,10 @@ const fixture = async () => {
     throw new Error("Cloud test storage is unavailable")
   }
 
-  const roomId = randomUUID()
-  const roundId = randomUUID()
-  const playerId = randomUUID()
-  const socketId = randomUUID()
-  const question = {
-    type: "single",
-    question: "Test?",
-    answers: ["Correct", "Wrong"],
-    solutions: [0],
-    time: 30,
-    cooldown: 3,
-  }
-  const fixtureStorage = storage
-  const lease = await storage.transaction(async (client) => {
-    await client.query(
-      "INSERT INTO rooms (id, invite_code, host_client_id, subject, status, current_position) VALUES ($1, $2, $3, 'Answer test', 'running', 1)",
-      [
-        roomId,
-        String(Math.floor(Math.random() * 1000000)).padStart(6, "0"),
-        randomUUID(),
-      ],
-    )
-    await client.query(
-      "INSERT INTO rounds (id, room_id, position, question_snapshot, status, closes_at) VALUES ($1, $2, 1, $3, 'open', clock_timestamp() + interval '1 minute')",
-      [roundId, roomId, question],
-    )
-    await client.query(
-      "INSERT INTO players (room_id, id, username, socket_id, connected) VALUES ($1, $2, 'Test player', $3, true)",
-      [roomId, playerId, socketId],
-    )
+  const record = await ownedRoom(storage)
+  rooms.push(record.roomId)
 
-    return acquireLocked(fixtureStorage, roomId, client)
-  })
-  rooms.push(roomId)
-  const game = new CloudGame(storage, roomId)
-
-  if (!lease) {
-    throw new Error("Fixture lease was not acquired")
-  }
-
-  game.attachLease(lease)
-  const submission = { playerId, socketId, roundId, position: 1, keys: [0] }
-
-  return {
-    storage,
-    game,
-    lease,
-    roomId,
-    roundId,
-    playerId,
-    socketId,
-    submission,
-  }
+  return record
 }
 
 it.skipIf(!enabled)(
@@ -322,7 +274,7 @@ it.skipIf(!enabled)(
     await releaseLease(db, lease)
     expect(await db.redis.get(`razzia:lease:${roomId}`)).toBe(successor.token)
     await expect(
-      withLease(db, successor, async (client) => {
+      withLease(db, { gameId: roomId, lease: successor }, async (client) => {
         const { rows } = await client.query(
           "SELECT id FROM rooms WHERE id = $1",
           [roomId],
@@ -410,5 +362,352 @@ it.skipIf(!enabled)(
     } finally {
       await probe.close()
     }
+  },
+)
+
+it.skipIf(!enabled)(
+  "rejects a valid lease from another room before changing state",
+  async () => {
+    const target = await fixture()
+    const other = await fixture()
+    const before = (
+      await target.storage.pool.query("SELECT * FROM rooms WHERE id = $1", [
+        target.roomId,
+      ])
+    ).rows
+    await expect(
+      target.storage.phase(
+        target.roomId,
+        { phase: "closed", position: 1 },
+        other.lease,
+      ),
+    ).rejects.toThrow("Room lease lost")
+    const foreign = new CloudGame(target.storage, target.roomId)
+    expect(() => foreign.attachLease(other.lease)).toThrow("Room lease lost")
+    expect(
+      (
+        await target.storage.pool.query("SELECT * FROM rooms WHERE id = $1", [
+          target.roomId,
+        ])
+      ).rows,
+    ).toEqual(before)
+  },
+)
+
+const committedPair = async (record: { storage: Cloud; roomId: string }) => {
+  const answers = await record.storage.pool.query<Record<string, unknown>>(
+    "SELECT * FROM answers WHERE room_id = $1 ORDER BY round_id, player_id",
+    [record.roomId],
+  )
+  const outbox = await record.storage.pool.query<Record<string, unknown>>(
+    "SELECT o.* FROM outbox o JOIN answers a USING (round_id, player_id) WHERE a.room_id = $1 ORDER BY o.event_id",
+    [record.roomId],
+  )
+
+  return { answers: answers.rows, outbox: outbox.rows }
+}
+
+it
+  .skipIf(!enabled)
+  .each(["before-answer", "before-outbox", "after-outbox"] as const)(
+  "commits answer/outbox together or rolls both back on failure %s",
+  async (stage) => {
+    const record = await fixture()
+    const { storage: db, game, submission, roundId } = record
+    const triggerName = `atomic_${randomUUID().replaceAll("-", "")}`
+    const targetTable = stage === "before-answer" ? "answers" : "outbox"
+    const timing = stage === "after-outbox" ? "AFTER" : "BEFORE"
+    await db.pool.query(
+      `CREATE FUNCTION ${triggerName}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'Atomic test failure'; END $$`,
+    )
+
+    try {
+      await db.pool.query(
+        `CREATE TRIGGER ${triggerName} ${timing} INSERT ON ${targetTable} FOR EACH ROW WHEN (NEW.round_id = '${roundId}'::uuid) EXECUTE FUNCTION ${triggerName}()`,
+      )
+      await expect(game.accept(submission)).rejects.toThrow(
+        "Atomic test failure",
+      )
+      expect(await committedPair(record)).toEqual({ answers: [], outbox: [] })
+    } finally {
+      await db.pool.query(
+        `DROP TRIGGER IF EXISTS ${triggerName} ON ${targetTable}`,
+      )
+      await db.pool.query(`DROP FUNCTION ${triggerName}()`)
+    }
+
+    await expect(game.accept(submission)).resolves.toMatchObject({
+      status: "accepted",
+    })
+    const committed = await committedPair(record)
+    expect(committed.answers).toHaveLength(1)
+    expect(committed.outbox).toHaveLength(1)
+    expect(committed.outbox[0]).toMatchObject({
+      round_id: roundId,
+      player_id: submission.playerId,
+    })
+    await expect(
+      game.accept({ ...submission, keys: [1] }),
+    ).resolves.toMatchObject({ status: "duplicate", answerKeys: [0] })
+    expect(await committedPair(record)).toEqual(committed)
+  },
+)
+
+it
+  .skipIf(!enabled)
+  .each(["pending", "closed", "expired", "cancelled", "finished"] as const)(
+  "creates no answer or outbox outside the valid window: %s",
+  async (state) => {
+    const record = await fixture()
+    const { storage: db, roomId, roundId, game, submission } = record
+
+    if (state === "pending" || state === "closed") {
+      await db.pool.query(
+        "UPDATE rounds SET status = $2, closes_at = clock_timestamp() + interval '1 hour' WHERE id = $1",
+        [roundId, state],
+      )
+    } else if (state === "expired") {
+      await db.pool.query(
+        "UPDATE rounds SET closes_at = clock_timestamp() WHERE id = $1",
+        [roundId],
+      )
+    } else {
+      await db.pool.query(
+        "UPDATE rooms SET status = $2, finished_at = CASE WHEN $2 = 'finished' THEN clock_timestamp() ELSE NULL END WHERE id = $1",
+        [roomId, state],
+      )
+    }
+
+    await expect(game.accept(submission)).resolves.toMatchObject({
+      status: "closed",
+    })
+    expect(await committedPair(record)).toEqual({ answers: [], outbox: [] })
+  },
+)
+
+it.skipIf(!enabled)(
+  "accepts within the window, but a retry after expiry preserves the committed answer",
+  async () => {
+    const record = await fixture()
+    const receipt = await record.game.accept(record.submission)
+    expect(receipt).toMatchObject({ status: "accepted", answerKeys: [0] })
+    const committed = await committedPair(record)
+    await record.storage.pool.query(
+      "UPDATE rounds SET status = 'closed', closes_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+      [record.roundId],
+    )
+    await expect(
+      record.game.accept({ ...record.submission, keys: [1] }),
+    ).resolves.toEqual({ ...receipt, status: "duplicate" })
+    expect(await committedPair(record)).toEqual(committed)
+  },
+)
+
+it.skipIf(!enabled)(
+  "rechecks the deadline after a submission waits for the room transaction lock",
+  async () => {
+    const record = await fixture()
+    const blocker = await record.storage.pool.connect()
+
+    try {
+      await blocker.query("BEGIN")
+      await blocker.query("SELECT id FROM rooms WHERE id = $1 FOR UPDATE", [
+        record.roomId,
+      ])
+      const receipt = record.game.accept(record.submission)
+      await blocker.query(
+        "UPDATE rounds SET closes_at = clock_timestamp() WHERE id = $1",
+        [record.roundId],
+      )
+      await blocker.query("COMMIT")
+      await expect(receipt).resolves.toMatchObject({ status: "closed" })
+      expect(await committedPair(record)).toEqual({ answers: [], outbox: [] })
+    } finally {
+      await blocker.query("ROLLBACK")
+      blocker.release()
+    }
+  },
+)
+
+it
+  .skipIf(!enabled)
+  .each(["missing", "token", "epoch", "database-expiry"] as const)(
+  "rejects all state writes with an invalid coordinator lease: %s",
+  async (reason) => {
+    const record = await fixture()
+    const { storage: db, roomId, lease } = record
+    const invalid =
+      reason === "missing"
+        ? undefined
+        : new RoomLease({
+            gameId: roomId,
+            token: reason === "token" ? randomUUID() : lease.token,
+            epoch: reason === "epoch" ? lease.epoch + 1 : lease.epoch,
+            deadline: performance.now() + 60000,
+          })
+
+    if (reason === "database-expiry") {
+      // Keep scanners out of this deliberately expired fixture.
+      await db.pool.query(
+        "UPDATE rooms SET status = 'cancelled', lease_until = '-infinity' WHERE id = $1",
+        [roomId],
+      )
+    }
+
+    const game = new CloudGame(db, roomId)
+
+    if (invalid) {
+      game.attachLease(invalid)
+    }
+
+    const state = async () => ({
+      rooms: (
+        await db.pool.query<Record<string, unknown>>(
+          "SELECT * FROM rooms WHERE id = $1",
+          [roomId],
+        )
+      ).rows,
+      players: (
+        await db.pool.query<Record<string, unknown>>(
+          "SELECT * FROM players WHERE room_id = $1",
+          [roomId],
+        )
+      ).rows,
+      pair: await committedPair(record),
+      lease: await db.redis.get(`razzia:lease:${roomId}`),
+      cache: await db.redis.hGetAll(`razzia:room:${roomId}`),
+    })
+    const original = await state()
+    const actions = [
+      () => game.accept(record.submission),
+      () =>
+        game.broadcast(
+          { name: STATUS.WAIT, data: { text: "invalid owner" } },
+          2,
+        ),
+      () =>
+        game.playerState(
+          record.playerId,
+          { name: STATUS.WAIT, data: { text: "invalid owner" } },
+          2,
+        ),
+      () =>
+        game.managerState(
+          { name: STATUS.SHOW_ROOM, data: { text: "invalid owner" } },
+          2,
+          null,
+        ),
+      () => game.managerConnection("invalid-owner", true),
+      () => db.phase(roomId, { phase: "closed", position: 1 }, invalid),
+      () => db.removeRoom(roomId, invalid),
+    ]
+    for (const action of actions) {
+      // oxlint-disable-next-line no-await-in-loop -- Check each rejected write before trying the next one.
+      await expect(action()).rejects.toThrow("Room lease lost")
+      // oxlint-disable-next-line no-await-in-loop -- Verify the snapshot after each individual attempt.
+      expect(await state()).toEqual(original)
+    }
+  },
+)
+
+it.skipIf(!enabled)(
+  "permits the current coordinator to persist game, player and host state",
+  async () => {
+    const record = await fixture()
+    await record.game.broadcast(
+      { name: STATUS.WAIT, data: { text: "valid owner" } },
+      1,
+    )
+    await record.game.playerState(
+      record.playerId,
+      { name: STATUS.WAIT, data: { text: "valid player state" } },
+      1,
+    )
+    await record.game.managerConnection("valid-host", true)
+    const {
+      rows: [room],
+    } = await record.storage.pool.query<{
+      runtime: { name: string }
+      manager_socket_id: string
+    }>("SELECT runtime, manager_socket_id FROM rooms WHERE id = $1", [
+      record.roomId,
+    ])
+    expect(room.runtime.name).toBe(STATUS.WAIT)
+    expect(room.manager_socket_id).toBe("valid-host")
+    await expect(record.game.accept(record.submission)).resolves.toMatchObject({
+      status: "accepted",
+    })
+  },
+)
+
+it.skipIf(!enabled)(
+  "allows one answer per round and preserves the previous round when advancing",
+  async () => {
+    const record = await fixture()
+    const first = await record.game.accept(record.submission)
+    expect(first).toMatchObject({ status: "accepted", answerKeys: [0] })
+    const roundId = randomUUID()
+    await record.storage.transaction(async (client) => {
+      await client.query("UPDATE rounds SET status = 'closed' WHERE id = $1", [
+        record.roundId,
+      ])
+      await client.query(
+        "INSERT INTO rounds (id, room_id, position, question_snapshot, status, closes_at) SELECT $1, room_id, 2, question_snapshot, 'open', clock_timestamp() + interval '1 minute' FROM rounds WHERE id = $2",
+        [roundId, record.roundId],
+      )
+      await client.query(
+        "UPDATE rooms SET current_position = 2 WHERE id = $1",
+        [record.roomId],
+      )
+    })
+    await expect(
+      record.game.accept({
+        ...record.submission,
+        roundId,
+        position: 2,
+        keys: [1],
+      }),
+    ).resolves.toMatchObject({ status: "accepted", roundId, answerKeys: [1] })
+    const committed = await committedPair(record)
+    expect(committed.answers).toHaveLength(2)
+    expect(committed.outbox).toHaveLength(2)
+    await expect(
+      record.game.accept({ ...record.submission, keys: [1] }),
+    ).resolves.toEqual({ ...first, status: "duplicate" })
+    await expect(
+      record.game.accept({
+        ...record.submission,
+        roundId,
+        position: 2,
+        keys: [0],
+      }),
+    ).resolves.toMatchObject({ status: "duplicate", answerKeys: [1] })
+    expect(await committedPair(record)).toEqual(committed)
+  },
+)
+
+it.skipIf(!enabled).each([0, 1000])(
+  "stores correctness and one point independently of quiz maxPoints=%s",
+  async (maxPoints) => {
+    const record = await fixture()
+    await record.storage.pool.query(
+      "UPDATE rounds SET question_snapshot = jsonb_set(question_snapshot, '{maxPoints}', to_jsonb($2::integer)) WHERE id = $1",
+      [record.roundId, maxPoints],
+    )
+    await expect(record.game.accept(record.submission)).resolves.toMatchObject({
+      status: "accepted",
+    })
+    expect(
+      (
+        await record.storage.pool.query<{ is_correct: boolean }>(
+          "SELECT is_correct FROM answers WHERE round_id = $1",
+          [record.roundId],
+        )
+      ).rows,
+    ).toEqual([{ is_correct: true }])
+    await applyScoreFixture(record.storage.pool, record.roomId)
+    expect((await record.game.scores(1)).map(({ points }) => points)).toEqual([
+      1,
+    ])
   },
 )

@@ -1,7 +1,9 @@
-import { parseAnswerEvent, secondBucket } from "./contract.mjs"
+import { secondBucket } from "./contract.mjs"
+import { loadAcceptedEvent } from "./accepted-event.mjs"
 
 export async function applyStats(db, redis, bloom, rawEvent, mode = "bloom") {
-  const event = parseAnswerEvent(rawEvent)
+  // Validate before the dedup fast path, which also updates the Redis HLL.
+  const event = await loadAcceptedEvent(db, rawEvent)
   const maybeDuplicate = bloom.has(event.event_id)
   let prechecked = false
 

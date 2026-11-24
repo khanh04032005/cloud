@@ -1,0 +1,14 @@
+{{- if .Values.apps.socket.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "razzia.fullname" . }}-socket
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "razzia.labels" (dict "root" . "component" "socket") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.apps.socket.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "razzia.selectorLabels" (dict "root" . "component" "socket") | nindent 6 }}
+{{- end }}

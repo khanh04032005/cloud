@@ -15,7 +15,7 @@ export default defineConfig({
   plugins: ["typescript"],
   overrides: [
     {
-      files: ["packages/streaming/**/*.mjs"],
+      files: ["packages/streaming/**/*.mjs", "role-d/lambda/**/*.mjs"],
       rules: {
         "@stylistic/padding-line-between-statements": "off",
         "init-declarations": "off",

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: razzia
+description: Live quiz web, socket gateways and Kafka streaming workers
+type: application
+version: 0.1.0
+appVersion: "4.0.2"
+kubeVersion: ">=1.30.0-0"

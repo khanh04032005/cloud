@@ -1,0 +1,503 @@
+{
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "properties": {
+        "registry": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9.:/_-]*[a-z0-9_-]$"
+        },
+        "tag": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$"
+        },
+        "pullPolicy": {
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      },
+      "required": ["registry", "tag", "pullPolicy"],
+      "additionalProperties": false
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+            "maxLength": 63
+          }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    "secretName": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+      "maxLength": 63
+    },
+    "nameOverride": {
+      "type": "string",
+      "pattern": "^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+      "maxLength": 53
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "pattern": "^$|^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+      "maxLength": 53
+    },
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "configRevision": {
+      "type": "string"
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "className": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": ["enabled", "className", "host", "annotations"],
+      "additionalProperties": false
+    },
+    "monitoring": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "interval": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(ms|s|m|h)$"
+        },
+        "scrapeTimeout": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*(ms|s|m|h)$"
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": ["enabled", "interval", "scrapeTimeout", "labels"],
+      "additionalProperties": false
+    },
+    "migration": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "string",
+          "minLength": 1
+        },
+        "activeDeadlineSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "backoffLimit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ttlSecondsAfterFinished": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        }
+      },
+      "required": [
+        "enabled",
+        "image",
+        "activeDeadlineSeconds",
+        "backoffLimit",
+        "ttlSecondsAfterFinished",
+        "resources"
+      ],
+      "additionalProperties": false
+    },
+    "apps": {
+      "type": "object",
+      "properties": {
+        "web": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/app"
+            },
+            {
+              "properties": {
+                "secretKeys": {
+                  "const": []
+                },
+                "port": {
+                  "const": 3000
+                },
+                "metrics": {
+                  "const": false
+                }
+              },
+              "required": [
+                "image",
+                "port",
+                "replicas",
+                "secretKeys",
+                "env",
+                "preStopSeconds",
+                "terminationGracePeriodSeconds",
+                "podSecurityContext",
+                "securityContext",
+                "resources",
+                "probe"
+              ]
+            }
+          ]
+        },
+        "socket": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/app"
+            },
+            {
+              "properties": {
+                "secretKeys": {
+                  "const": [
+                    "DATABASE_URL",
+                    "REDIS_URL",
+                    "JWT_SECRET",
+                    "MANAGER_PASSWORD"
+                  ]
+                }
+              },
+              "required": [
+                "image",
+                "port",
+                "replicas",
+                "secretKeys",
+                "env",
+                "preStopSeconds",
+                "terminationGracePeriodSeconds",
+                "podSecurityContext",
+                "securityContext",
+                "resources",
+                "probe",
+                "hpa",
+                "pdb",
+                "metrics"
+              ]
+            }
+          ]
+        },
+        "publisher": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/app"
+            },
+            {
+              "properties": {
+                "secretKeys": {
+                  "const": ["DATABASE_URL", "KAFKA_BROKERS"]
+                }
+              },
+              "required": [
+                "image",
+                "port",
+                "replicas",
+                "secretKeys",
+                "env",
+                "preStopSeconds",
+                "terminationGracePeriodSeconds",
+                "podSecurityContext",
+                "securityContext",
+                "resources",
+                "command",
+                "metrics"
+              ]
+            }
+          ]
+        },
+        "score": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/app"
+            },
+            {
+              "properties": {
+                "secretKeys": {
+                  "const": ["DATABASE_URL", "REDIS_URL", "KAFKA_BROKERS"]
+                }
+              },
+              "required": [
+                "image",
+                "port",
+                "replicas",
+                "secretKeys",
+                "env",
+                "preStopSeconds",
+                "terminationGracePeriodSeconds",
+                "podSecurityContext",
+                "securityContext",
+                "resources",
+                "command",
+                "metrics"
+              ]
+            }
+          ]
+        },
+        "stats": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/app"
+            },
+            {
+              "properties": {
+                "secretKeys": {
+                  "const": ["DATABASE_URL", "REDIS_URL", "KAFKA_BROKERS"]
+                }
+              },
+              "required": [
+                "image",
+                "port",
+                "replicas",
+                "secretKeys",
+                "env",
+                "preStopSeconds",
+                "terminationGracePeriodSeconds",
+                "podSecurityContext",
+                "securityContext",
+                "resources",
+                "command",
+                "metrics"
+              ]
+            }
+          ]
+        }
+      },
+      "required": ["web", "socket", "publisher", "score", "stats"],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "image",
+    "imagePullSecrets",
+    "secretName",
+    "nameOverride",
+    "fullnameOverride",
+    "nodeSelector",
+    "tolerations",
+    "configRevision",
+    "ingress",
+    "monitoring",
+    "migration",
+    "apps"
+  ],
+  "additionalProperties": false,
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "resources": {
+      "type": "object",
+      "properties": {
+        "requests": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string",
+              "minLength": 1
+            },
+            "memory": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["cpu", "memory"],
+          "additionalProperties": false
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string",
+              "minLength": 1
+            },
+            "memory": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["memory"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["requests", "limits"],
+      "additionalProperties": false
+    },
+    "app": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "replicas": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "secretKeys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "metrics": {
+          "type": "boolean"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "probe": {
+          "type": "object",
+          "properties": {
+            "live": {
+              "type": "string",
+              "pattern": "^/"
+            },
+            "ready": {
+              "type": "string",
+              "pattern": "^/"
+            }
+          },
+          "required": ["live", "ready"],
+          "additionalProperties": false
+        },
+        "preStopSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 120
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600
+        },
+        "podSecurityContext": {
+          "type": "object"
+        },
+        "securityContext": {
+          "type": "object"
+        },
+        "resources": {
+          "$ref": "#/definitions/resources"
+        },
+        "hpa": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "minReplicas": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maxReplicas": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "targetCPUUtilizationPercentage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "scaleDownStabilizationSeconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3600
+            }
+          },
+          "required": [
+            "enabled",
+            "minReplicas",
+            "maxReplicas",
+            "targetCPUUtilizationPercentage",
+            "scaleDownStabilizationSeconds"
+          ],
+          "additionalProperties": false
+        },
+        "pdb": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "minAvailable": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": ["enabled", "minAvailable"],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "image",
+        "port",
+        "replicas",
+        "secretKeys",
+        "env",
+        "preStopSeconds",
+        "terminationGracePeriodSeconds",
+        "podSecurityContext",
+        "securityContext",
+        "resources"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

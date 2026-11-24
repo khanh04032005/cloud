@@ -45,6 +45,14 @@ jobs:
       - name: Run tests
         run: pnpm test
 
+      - name: Check streaming and Lambda database contracts
+        run: |
+          pnpm --filter @razzia/streaming test
+          node --test role-d/lambda/export-results/logic.test.mjs
+
+      - name: Check backend invariants with PostgreSQL and Redis
+        run: pnpm test:cloud
+
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest

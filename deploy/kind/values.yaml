@@ -1,0 +1,18 @@
+# Matches the four razzia/{web,socket,worker,migrate}:local images loaded into kind.
+image:
+  registry: razzia
+  tag: local
+  pullPolicy: Never
+
+# Local access uses deploy/kind/proxy.yaml and kubectl port-forward.
+ingress:
+  enabled: false
+monitoring:
+  enabled: false
+apps:
+  web:
+    replicas: 1
+  socket:
+    replicas: 2
+    hpa:
+      enabled: false

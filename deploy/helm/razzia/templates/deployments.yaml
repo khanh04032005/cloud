@@ -1,0 +1,152 @@
+{{- include "razzia.validate" . }}
+{{- range $name, $app := .Values.apps }}
+{{- $context := dict "root" $ "component" $name }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "razzia.fullname" $ }}-{{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "razzia.labels" $context | nindent 4 }}
+spec:
+  {{- if not (and (eq $name "socket") $.Values.apps.socket.hpa.enabled) }}
+  replicas: {{ $app.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "razzia.selectorLabels" $context | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "razzia.selectorLabels" $context | nindent 8 }}
+      {{- if and (ne $name "web") $.Values.configRevision }}
+      annotations:
+        razzia/config-revision: {{ $.Values.configRevision | quote }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ $app.terminationGracePeriodSeconds }}
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $app.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        {{- range list "kubernetes.io/hostname" "topology.kubernetes.io/zone" }}
+        - maxSkew: 1
+          topologyKey: {{ . }}
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "razzia.selectorLabels" $context | nindent 14 }}
+        {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "razzia.image" (dict "root" $ "image" $app.image) | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          {{- with $app.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml $app.securityContext | nindent 12 }}
+          ports:
+            - name: {{ if or (eq $name "web") (eq $name "socket") }}http{{ else }}metrics{{ end }}
+              containerPort: {{ $app.port }}
+              protocol: TCP
+          {{- if or $app.secretKeys $app.env (ne $name "web") }}
+          env:
+            {{- if eq $name "socket" }}
+            - name: SOCKET_PORT
+              value: {{ $app.port | quote }}
+            - name: CONFIG_PATH
+              value: /app/config
+            {{- else if ne $name "web" }}
+            - name: METRICS_PORT
+              value: {{ $app.port | quote }}
+            {{- end }}
+            {{- range $app.secretKeys }}
+            - name: {{ . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secretName }}
+                  key: {{ . }}
+            {{- end }}
+            {{- range $key, $value := $app.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          {{- with $app.probe }}
+          startupProbe:
+            httpGet: { path: {{ .live | quote }}, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: { path: {{ .live | quote }}, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: {{ .ready | quote }}, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          {{- else }}
+          # Process HTTP listener only: this does not prove Kafka/DB readiness.
+          startupProbe:
+            tcpSocket: { port: metrics }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: { port: metrics }
+            periodSeconds: 5
+          # No dependency-based liveness: avoid restart loops during Kafka outages.
+          {{- end }}
+          {{- if gt (int $app.preStopSeconds) 0 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", {{ $app.preStopSeconds | quote }}]
+          {{- end }}
+          resources:
+            {{- toYaml $app.resources | nindent 12 }}
+          {{- if ne $name "web" }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if eq $name "socket" }}
+            - name: config
+              mountPath: /app/config
+            {{- end }}
+          {{- end }}
+      {{- if ne $name "web" }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if eq $name "socket" }}
+        - name: config
+          emptyDir: {}
+        {{- end }}
+      {{- end }}
+{{- end }}

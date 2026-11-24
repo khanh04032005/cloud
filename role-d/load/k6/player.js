@@ -18,6 +18,8 @@ const sent = new Counter("answers_sent")
 const duplicates = new Counter("duplicate_submissions")
 const duplicateAcks = new Counter("duplicate_acks")
 const failures = new Rate("player_failures")
+// Event-loop lag proxy: server emits game:cooldown via setInterval(1000).
+const tickJitter = new Trend("cooldown_jitter_ms", true)
 
 const BASE = __ENV.BASE_URL
 const CODES = (__ENV.INVITE_CODES || "")
@@ -28,6 +30,10 @@ const MODE = __ENV.ANSWER_MODE || "random"
 const SCENARIO = __ENV.SCENARIO || "play"
 const RECONNECT_EVERY = Number(__ENV.RECONNECT_EVERY || 10)
 const SOCKET_MS = Number(__ENV.SOCKET_MS || 180000)
+// BCAST_LOG=1: log receive time of room-wide events; analyse with load/bcast-spread.mjs.
+// Use with k6 --console-output=<file> so the lines do not flood the terminal.
+const BCAST_LOG = __ENV.BCAST_LOG === "1"
+const BCAST_EVENTS = new Set(["SHOW_START", "SHOW_QUESTION", "SELECT_ANSWER", "SHOW_RESULT"])
 
 function stages() {
   if (!__ENV.STAGES) {
@@ -82,7 +88,8 @@ function answerDelay(timeSeconds) {
     return Math.max(0, windowMs - 1500)
   }
 
-  return Math.floor(Math.random() * windowMs * 0.7)
+  // k6 socket.setTimeout rejects 0
+  return Math.max(1, Math.floor(Math.random() * windowMs * 0.7))
 }
 
 function postJson(pathname, body, token, name) {
@@ -108,6 +115,7 @@ function runSocket(opts) {
     let ackAt = 0
     let acks = 0
     let choice = 0
+    let lastTick = 0
 
     socket.on("message", (raw) => {
       const packet = parseEnginePacket(String(raw))
@@ -143,6 +151,23 @@ function runSocket(opts) {
       }
 
       const [event, payload] = packet.packet.data
+      const now = Date.now()
+
+      if (event === "game:cooldown") {
+        if (lastTick) {
+          tickJitter.add(Math.abs(now - lastTick - 1000))
+        }
+        lastTick = now
+      } else if (event === "game:startCooldown") {
+        lastTick = now
+      } else if (event === "game:status") {
+        // first tick comes 1 s after SELECT_ANSWER; other statuses stop the countdown
+        lastTick = payload?.name === "SELECT_ANSWER" ? now : 0
+      }
+
+      if (BCAST_LOG && event === "game:status" && BCAST_EVENTS.has(payload?.name)) {
+        console.log(`BCAST ${payload.name} ${questionKey} ${now}`)
+      }
 
       if (event === "game:reset") {
         console.error(`reset ${payload}`)
@@ -280,6 +305,7 @@ export default function () {
   }
 
   if (!wantReconnect || !first.shouldReconnect) {
+    failures.add(0)
     return
   }
 
@@ -297,5 +323,7 @@ export default function () {
 
   if (!second.reconnected) {
     noteFailure(`reconnect thất bại ${seat.gameId}`)
+  } else {
+    failures.add(0)
   }
 }

@@ -1,0 +1,33 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "razzia.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "razzia.labels" (dict "root" . "component" "ingress") | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.ingress.annotations | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - {{- if .Values.ingress.host }}
+      host: {{ .Values.ingress.host | quote }}
+      {{- end }}
+      http:
+        paths:
+          {{- range list "/api" "/ws" }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "razzia.fullname" $ }}-socket
+                port: { name: http }
+          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "razzia.fullname" . }}-web
+                port: { name: http }
+{{- end }}

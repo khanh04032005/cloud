@@ -8,4 +8,5 @@ release.json
 /.corepack
 /.pnpm-store
 /.docker-config
+/.tools/
 /packages/streaming/.replay-baseline.json

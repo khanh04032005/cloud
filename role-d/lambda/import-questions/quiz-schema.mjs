@@ -1,1 +1,1 @@
-export { LIMITS, validateRazziaQuiz } from "../../questions/quiz-schema.mjs"
+export * from "../../questions/quiz-schema.mjs"

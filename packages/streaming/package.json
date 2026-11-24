@@ -6,7 +6,8 @@
     "start:publisher": "node src/publisher.mjs",
     "start:score": "node src/score-worker.mjs",
     "start:stats": "node src/stats-worker.mjs",
-    "test": "node --test src/*.test.mjs"
+    "test": "node --test src/*.test.mjs",
+    "test:integration": "node --test scripts/integration.test.mjs scripts/database-invariants.test.mjs"
   },
   "dependencies": {
     "kafkajs": "^2.2.4",

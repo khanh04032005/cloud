@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# E01: one load level against the original Razzia 4.0.2 running locally in Docker.
+# Restarts the container, logs CPU, opens a room with role-d/load/host.mjs, plays one
+# game with k6, then appends one summary row to $OUT/summary.csv.
+#
+#   scripts/bench/e01.sh 100 random
+#   for n in 50 100 200 500; do scripts/bench/e01.sh $n random; done
+#
+# Env: OUT (~/e01), IMAGE (ralex91/razzia:4.0.2), CONTAINER (razzia-base), PORT (3000),
+#      SERVER_CPUS (0), K6_CPUS (1-5), MANAGER_PASSWORD (admin),
+#      NGINX_CONF (file mounted over /etc/nginx/nginx.conf, e.g. scripts/bench/nginx-8k.conf),
+#      DIRECT (1 = k6 and host talk to node on container port 3001, skipping nginx)
+# Options only apply when the container is created, so give each variant its own CONTAINER:
+#   CONTAINER=razzia-nginx8k NGINX_CONF=scripts/bench/nginx-8k.conf OUT=~/e01-nginx8k scripts/bench/e01.sh 500 random
+#   CONTAINER=razzia-direct DIRECT=1 PORT=3002 OUT=~/e01-direct scripts/bench/e01.sh 500 random
+set -euo pipefail
+
+N=${1:?usage: e01.sh <players> [random|end|immediate]}
+MODE=${2:-random}
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+OUT=${OUT:-$HOME/e01}
+IMAGE=${IMAGE:-ralex91/razzia:4.0.2}
+CONTAINER=${CONTAINER:-razzia-base}
+PORT=${PORT:-3000}
+SERVER_CPUS=${SERVER_CPUS:-0}
+K6_CPUS=${K6_CPUS:-1-5}
+PASSWORD=${MANAGER_PASSWORD:-admin}
+NGINX_CONF=${NGINX_CONF:+$(realpath "$NGINX_CONF")}  # resolve before cd role-d
+DIRECT=${DIRECT:-0}
+# host starts the game after WAIT_MS even if fewer than N joined; player sockets must outlive
+# WAIT_MS + the game, or they close right as the game starts (0 answers, as in the first 500 run)
+WAIT_MS=${WAIT_MS:-120000}
+MAX_GAME_MS=${MAX_GAME_MS:-600000}
+BASE=http://localhost:$PORT
+TAG=$N-$MODE
+
+mkdir -p "$OUT"
+cd "$ROOT/role-d"
+log() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
+
+pids=()
+cleanup() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; }
+trap cleanup EXIT
+
+# 1. fresh server: game state lives in RAM, restart wipes it
+if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+  docker restart "$CONTAINER" >/dev/null
+else
+  run_opts=(--ulimit nofile=65536:65536)
+  if [[ $DIRECT == 1 ]]; then run_opts+=(-p "$PORT:3001"); else run_opts+=(-p "$PORT:3000"); fi
+  [[ -n $NGINX_CONF ]] && run_opts+=(-v "$NGINX_CONF:/etc/nginx/nginx.conf:ro")
+  docker run -d --name "$CONTAINER" "${run_opts[@]}" --cpuset-cpus="$SERVER_CPUS" \
+    -e MANAGER_PASSWORD="$PASSWORD" -e JWT_SECRET="$(openssl rand -hex 32)" "$IMAGE" >/dev/null
+fi
+# nginx in the image serves "/" before node (port 3001) is listening, so a 200 on "/"
+# is not enough: wait until /api stops returning 502 (any 2xx/4xx means node answered)
+for _ in $(seq 1 60); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/auth/session" || true)
+  [[ $code != 000 && $code != 502 ]] && break
+  sleep 1
+done
+log "server up ($CONTAINER, cpuset $SERVER_CPUS)"
+
+# 2. CPU logger, every 0.5 s: time, server cpu% (100 = one core), server mem, k6 cpu%.
+# Read from the container cgroup and /proc instead of `docker stats` (slow with many
+# containers, and it once wrote nothing for a whole run) and `ps %cpu` (lifetime average).
+CG=/sys/fs/cgroup/system.slice/docker-$(docker inspect -f '{{.Id}}' "$CONTAINER").scope
+TICK=$(getconf CLK_TCK)
+(
+  set +e  # script runs with -e and pipefail: a failing pgrep before k6 starts must not kill the logger
+  prev_s=$(awk '/^usage_usec/{print $2}' "$CG/cpu.stat"); prev_t=$(date +%s%N); prev_k=0; kpid=""
+  while true; do
+    sleep 0.5
+    now_t=$(date +%s%N)
+    now_s=$(awk '/^usage_usec/{print $2}' "$CG/cpu.stat" 2>/dev/null) || break
+    mem=$(( $(cat "$CG/memory.current") / 1048576 ))
+    [[ -n $kpid && -d /proc/$kpid ]] || { kpid=$(pgrep -x k6 | head -1 || true); prev_k=0; }
+    now_k=0
+    [[ -n $kpid ]] && now_k=$(awk '{print $14+$15}' "/proc/$kpid/stat" 2>/dev/null || echo 0)
+    dt=$(( (now_t - prev_t) / 1000 ))  # usec
+    awk -v t="$(date +%T)" -v ds=$((now_s - prev_s)) -v dk=$((prev_k ? now_k - prev_k : 0)) \
+        -v dt=$dt -v tick=$TICK -v mem=$mem \
+        'BEGIN{printf "%s,%.1f%%,%dMiB / -,%.1f\n", t, 100*ds/dt, mem, 100*dk/tick/(dt/1e6)}'
+    prev_s=$now_s; prev_t=$now_t; prev_k=$now_k
+  done
+) >"$OUT/cpu-$TAG.csv" &
+pids+=($!)
+
+# 3. host opens the room and waits for N players
+BASE_URL=$BASE MANAGER_PASSWORD=$PASSWORD QUIZ_FILE=questions/out/opentrivia-load.json \
+EXPECTED_PLAYERS=$N WAIT_MS=$WAIT_MS MAX_GAME_MS=$MAX_GAME_MS CODES_FILE="$OUT/codes-$TAG.json" \
+  node load/host.mjs >"$OUT/host-$TAG.log" 2>&1 &
+HOST=$!
+pids+=($HOST)
+
+CODE=""
+for _ in $(seq 1 60); do
+  CODE=$(grep -o 'INVITE_CODES=[0-9,]*' "$OUT/host-$TAG.log" 2>/dev/null | cut -d= -f2 || true)
+  [[ -n $CODE ]] && break
+  kill -0 $HOST 2>/dev/null || { cat "$OUT/host-$TAG.log"; exit 1; }
+  sleep 1
+done
+[[ -n $CODE ]] || { log "host không in INVITE_CODES"; cat "$OUT/host-$TAG.log"; exit 1; }
+log "room $CODE, starting k6 with $N players ($MODE)"
+
+# 4. players: one game each
+set +e
+BASE_URL=$BASE INVITE_CODES=$CODE ANSWER_MODE=$MODE SOCKET_MS=$((WAIT_MS + MAX_GAME_MS + 60000)) BCAST_LOG=1 \
+  taskset -c "$K6_CPUS" k6 run -q --vus "$N" --iterations "$N" \
+  --console-output="$OUT/bcast-$TAG.log" \
+  --summary-export "$OUT/k6-$TAG.json" \
+  load/k6/player.js >"$OUT/k6-$TAG.log" 2>&1
+K6_EXIT=$?
+wait $HOST
+HOST_EXIT=$?
+set -e
+sleep 2
+cleanup
+log "k6 exit $K6_EXIT, host exit $HOST_EXIT"
+grep -E '^(start|finished|Hết)' "$OUT/host-$TAG.log" || true
+
+# 5. summary row
+ROW=$(
+  jq -r --arg n "$N" --arg mode "$MODE" '.metrics as $m | [
+    $n, $mode,
+    ($m.answer_ack_ms["med"] // ""), ($m.answer_ack_ms["p(95)"] // ""), ($m.answer_ack_ms["max"] // ""),
+    ($m.join_ms["p(95)"] // ""), ($m.ws_connecting["p(95)"] // ""),
+    ($m.cooldown_jitter_ms["p(95)"] // ""), ($m.cooldown_jitter_ms["max"] // ""),
+    ($m.player_failures.value // ""), ($m.http_req_failed.value // ""),
+    ($m.answers_sent.count // 0), ($m.answers_accepted.count // 0),
+    ($m.ws_msgs_received.count // 0)
+  ] | @csv' "$OUT/k6-$TAG.json"
+)
+SPREAD=$(node load/bcast-spread.mjs "$OUT/bcast-$TAG.log" --json 2>/dev/null |
+  jq -r '(map(select(.event=="SELECT_ANSWER"))[0] // {}) as $s
+    | (map(select(.event=="SHOW_RESULT"))[0] // {}) as $r
+    | [($s.spread_max // ""), ($r.spread_max // ""), ($r.lag_p95 // "")] | map(tostring) | join(",")' || true)
+[[ -n $SPREAD ]] || SPREAD=",,"
+CPU=$(awk -F, '{gsub("%","",$2); c=$2+0; if(c>m)m=c; s+=c; n++; k=$NF+0; if(k>km)km=k; split($3,a," "); mem=a[1]}
+  END{printf "%.1f,%.1f,%.1f,%s", m, (n?s/n:0), km, mem}' "$OUT/cpu-$TAG.csv")
+PLAYERS=$(grep -o 'with [0-9]*/' "$OUT/host-$TAG.log" | grep -o '[0-9]*' || echo 0)
+
+SUMMARY=$OUT/summary.csv
+[[ -f $SUMMARY ]] || echo "time,players,mode,ack_p50,ack_p95,ack_max,join_p95,ws_connect_p95,jitter_p95,jitter_max,player_fail_rate,http_fail_rate,answers_sent,answers_accepted,ws_msgs_received,select_spread_max,result_spread_max,result_lag_p95,server_cpu_max,server_cpu_avg,k6_cpu_max,server_mem_last,joined,k6_exit" >"$SUMMARY"
+echo "$(date +%FT%T),$ROW,$SPREAD,$CPU,$PLAYERS,$K6_EXIT" | sed 's/"//g' >>"$SUMMARY"
+log "row added to $SUMMARY"
+tail -1 "$SUMMARY"

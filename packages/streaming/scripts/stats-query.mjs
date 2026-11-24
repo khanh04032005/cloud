@@ -16,7 +16,7 @@ try {
       [roomId],
     ),
     pool.query(
-      "SELECT player_id, points FROM player_scores WHERE room_id = $1 ORDER BY points DESC, player_id",
+      "SELECT player_id, points FROM results WHERE room_id = $1 ORDER BY points DESC, player_id",
       [roomId],
     ),
   ])

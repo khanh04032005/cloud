@@ -1,3 +1,5 @@
+> Cập nhật 19/11/2026: bảng xung đột bên dưới ghi lại trạng thái trước tích hợp. Hợp đồng đang dùng và cách chạy hiện tại nằm ở [database-schema.md](database-schema.md).
+
 # Vai C — Guideline thực chiến: merge, đóng gói, hạ tầng, deploy
 
 > Viết ngày 14/11/2026, sau khi đọc 4 nhánh trên `origin`. Đọc theo thứ tự từ trên xuống, mỗi phần có **Làm ngay**, **Bản chất** và **Xong khi** (tiêu chí hoàn thành).

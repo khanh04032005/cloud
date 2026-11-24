@@ -5,17 +5,18 @@ export async function publishBatch(db, producer, topic, batchSize = 100) {
 
   try {
     const { rows } = await db.query(
-      `SELECT event_id, room_id, payload FROM outbox
-       WHERE published_at IS NULL ORDER BY created_at, event_id
-       FOR UPDATE SKIP LOCKED LIMIT $1`,
+      `SELECT o.event_id, a.room_id, a.round_id, a.player_id,
+              a.choice, a.answer_keys, a.is_correct, a.accepted_at
+       FROM outbox o JOIN answers a USING (round_id, player_id)
+       WHERE o.published_at IS NULL ORDER BY o.created_at, o.event_id
+       LIMIT $1 FOR UPDATE OF o SKIP LOCKED`,
       [batchSize],
     )
     const messages = rows.map((row) => {
-      const event = parseAnswerEvent(row.payload)
-
-      if (event.event_id !== row.event_id || event.room_id !== row.room_id) {
-        throw new Error(`Outbox envelope does not match row ${row.event_id}`)
-      }
+      const event = parseAnswerEvent({
+        ...row,
+        accepted_at: row.accepted_at.toISOString(),
+      })
 
       return {
         key: row.room_id,

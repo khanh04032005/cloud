@@ -2,22 +2,21 @@
 
 Bám [khanh04032005/cloud](https://github.com/khanh04032005/cloud) tại Razzia **4.0.2** (`8345663f7f`, 28/10/2026) và nhánh `feature/role-b-streaming` (`82a335978d`). Protocol người chơi là Socket.IO trên `/ws` của bản đó, không phải NestJS.
 
-Chưa có schema của A và chưa có URL AWS. Phần chạy được trên máy và phần mô tả thì xong. Số p50/p95, lag, chi phí thật để trống trong `experiments/results-template.csv` cho đến buổi đo.
+Đã thống nhất schema A–B–D; xem `../docs/database-schema.md`. Chưa có kết quả nghiệm thu AWS. Số p50/p95, lag, chi phí thật để trống trong `experiments/results-template.csv` cho đến buổi đo.
 
 ## Việc trong thư mục này
 
-| Việc được giao | File |
-| --- | --- |
-| OpenTriviaQA → JSON Razzia, CC BY-SA 4.0 | `questions/` |
-| Schema bộ câu hỏi | `db/010_question_sets.sql` |
-| Đề xuất bảng cho A | `db/000_proposed_for_A.sql` |
-| Hai Lambda + lifecycle S3 | `lambda/`, `infra/` |
-| k6: vào phòng, trả lời, gửi lại, nối lại | `load/k6/player.js` |
-| Host giữ phòng và bấm sang câu | `load/host.mjs` |
-| Máy phát tải riêng | `load/ec2-loadgen.sh` |
-| Sáu thí nghiệm + đối chiếu điểm | `experiments/`, `db/011_score_audit.sql` |
-| Dashboard Grafana (metric của B) | `grafana/razzia-role-d.json` |
-| Chương báo cáo của D | `docs/bao-cao-vai-d.md` |
+| Việc được giao                           | File                                                                  |
+| ---------------------------------------- | --------------------------------------------------------------------- |
+| OpenTriviaQA → JSON Razzia, CC BY-SA 4.0 | `questions/`                                                          |
+| Schema chung và provenance S3            | `../packages/socket/migrations/001–007`, `../docs/database-schema.md` |
+| Hai Lambda + lifecycle S3                | `lambda/`, `infra/`                                                   |
+| k6: vào phòng, trả lời, gửi lại, nối lại | `load/k6/player.js`                                                   |
+| Host giữ phòng và bấm sang câu           | `load/host.mjs`                                                       |
+| Máy phát tải riêng                       | `load/ec2-loadgen.sh`                                                 |
+| Sáu thí nghiệm + đối chiếu điểm          | `experiments/`, migration `007_score_audit.sql`                       |
+| Dashboard Grafana (metric của B)         | `grafana/razzia-role-d.json`                                          |
+| Chương báo cáo của D                     | `docs/bao-cao-vai-d.md`                                               |
 
 ## Câu hỏi
 
@@ -35,7 +34,7 @@ Ra hai file:
 - `opentrivia-load.json`: 8 câu, 10 giây, không category. Dùng cho k6. Không gắn category vì Razzia gộp các câu cùng category và bỏ bớt màn leaderboard, host sẽ lệch nhịp bấm.
 - `opentrivia-bank.json`: 120 câu. Upload lên `s3://<bucket-import>/imports/opentrivia-bank.json`.
 
-`maxPoints` đặt bằng 1. Razzia gốc vẫn nhân điểm theo tốc độ cho đến khi A sửa scorer. Không ghi trong báo cáo rằng baseline đã là 1 điểm/câu.
+`maxPoints` đặt bằng 1. Hệ thống A–B chấm đúng 1 điểm/câu đúng; Razzia gốc dùng để đo baseline vẫn tính điểm theo tốc độ.
 
 ## Lambda
 
@@ -47,7 +46,7 @@ C apply `infra/` (state remote của C, không apply song song). Lambda phải n
 
 Nạp: PUT object dưới prefix `imports/`, đuôi `.json`. Cùng ETag thì lần sau bỏ qua, không nhân đôi câu hỏi.
 
-Xuất, sau khi A/B đã có bảng điểm:
+Xuất, sau khi worker đã xử lý hết đáp án:
 
 ```bash
 aws lambda invoke \

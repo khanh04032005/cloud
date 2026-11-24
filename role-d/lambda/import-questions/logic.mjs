@@ -5,80 +5,65 @@ export function sha256(buffer) {
   return createHash("sha256").update(buffer).digest("hex")
 }
 
-export function questionRows(setId, quiz) {
-  return quiz.questions.map((question, position) => ({
-    id: randomUUID(),
-    setId,
-    position,
-    prompt: question.question.trim(),
-    answers: question.answers.map((answer) => answer.trim()),
-    solution: question.solutions[0],
-    cooldownSeconds: question.cooldown,
-    timeSeconds: question.time,
-    maxPoints: question.maxPoints ?? 1,
-  }))
-}
-
 export function buildImportPlan({ bucket, key, etag, body, license }) {
   let parsed
-
   try {
     parsed = JSON.parse(body.toString("utf8"))
   } catch {
     return { ok: false, error: "File không phải JSON." }
   }
-
   const validated = validateRazziaQuiz(parsed)
-
   if (!validated.ok) {
     return { ok: false, error: validated.errors.join(" ") }
   }
-
+  const quizId = randomUUID()
   const digest = sha256(body)
-  const setId = randomUUID()
-
   return {
     ok: true,
-    setId,
+    quizId,
     sha256: digest,
     questionCount: parsed.questions.length,
     statements: [
       {
-        text: `INSERT INTO question_sets
-          (id, subject, s3_bucket, s3_key, s3_etag, sha256, question_count, license, document)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
-        values: [
-          setId,
-          parsed.subject.trim(),
-          bucket,
-          key,
-          etag,
-          digest,
-          parsed.questions.length,
-          license,
-          JSON.stringify(parsed),
-        ],
+        text: "INSERT INTO quizzes (id, subject, game_mode) VALUES ($1, $2, $3)",
+        values: [quizId, parsed.subject.trim(), parsed.gameMode],
       },
-      ...questionRows(setId, parsed).map((row) => ({
-        text: `INSERT INTO questions
-          (id, set_id, position, prompt, answers, solution, cooldown_seconds, time_seconds, max_points)
-          VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)`,
-        values: [
-          row.id,
-          row.setId,
-          row.position,
-          row.prompt,
-          JSON.stringify(row.answers),
-          row.solution,
-          row.cooldownSeconds,
-          row.timeSeconds,
-          row.maxPoints,
-        ],
-      })),
+      {
+        text: `INSERT INTO quiz_imports
+          (s3_bucket, s3_key, s3_etag, quiz_id, sha256, license)
+          VALUES ($1, $2, $3, $4, $5, $6)
+          ON CONFLICT (s3_bucket, s3_key, s3_etag) DO NOTHING RETURNING quiz_id`,
+        values: [bucket, key, etag, quizId, digest, license],
+      },
+      {
+        text: `INSERT INTO questions (quiz_id, position, definition)
+          SELECT $1, position, definition
+          FROM jsonb_array_elements($2::jsonb) WITH ORDINALITY AS entry(definition, position)`,
+        values: [quizId, JSON.stringify(parsed.questions)],
+      },
     ],
   }
 }
 
-export function isUniqueViolation(error) {
-  return error?.code === "23505"
+export async function applyImportPlan(client, plan) {
+  if (!plan.ok) {
+    throw new Error("Cannot apply an invalid import plan")
+  }
+  await client.query("BEGIN")
+  try {
+    const [quiz, provenance, questions] = plan.statements
+    await client.query(quiz.text, quiz.values)
+    const inserted = await client.query(provenance.text, provenance.values)
+    if (inserted.rows.length === 0) {
+      // Roll back the new quiz too; a duplicate S3 delivery creates no orphan catalog.
+      await client.query("ROLLBACK")
+      return { status: "duplicate" }
+    }
+    await client.query(questions.text, questions.values)
+    await client.query("COMMIT")
+    return { status: "imported", quizId: plan.quizId }
+  } catch (error) {
+    await client.query("ROLLBACK")
+    throw error
+  }
 }

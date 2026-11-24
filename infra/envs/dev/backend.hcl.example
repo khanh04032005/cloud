@@ -1,0 +1,6 @@
+# cp backend.hcl.example backend.hcl, rồi sửa tên bucket cho trùng với infra/bootstrap
+bucket       = "razzia-tfstate-<ten-nhom>"
+key          = "dev/terraform.tfstate"
+region       = "ap-southeast-1"
+use_lockfile = true
+encrypt      = true

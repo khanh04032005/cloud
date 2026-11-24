@@ -1,0 +1,18 @@
+# Only for scripts/test-streaming.sh: an isolated project with host test endpoints.
+services:
+  socket-1:
+    ports: ["${INTEGRATION_SOCKET_A_PORT:-13001}:3001"]
+  socket-2:
+    ports: ["${INTEGRATION_SOCKET_B_PORT:-13002}:3001"]
+  publisher:
+    ports: !reset []
+  score:
+    ports: !reset []
+  stats:
+    ports: !reset []
+  kafka:
+    ports: ["${INTEGRATION_KAFKA_PORT:-29092}:29092"]
+    environment:
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092,CONTROLLER://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${INTEGRATION_KAFKA_PORT:-29092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT

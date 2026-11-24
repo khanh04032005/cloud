@@ -63,13 +63,13 @@ test("import plan rejects a bad quiz and accepts a good one once", () => {
 
   assert.equal(good.ok, true)
   assert.equal(good.questionCount, 1)
-  assert.equal(good.statements.length, 2)
+  assert.equal(good.statements.length, 3)
   assert.match(good.sha256, /^[a-f0-9]{64}$/)
 })
 
 test("results query is scoped when a room is requested", () => {
   const scoped = resultsSql("room-1")
-  assert.match(scoped.text, /ps\.room_id = \$1/)
+  assert.match(scoped.text, /p\.room_id = \$1/)
   assert.deepEqual(scoped.values, ["room-1"])
   assert.equal(resultsSql(null).values.length, 0)
 })

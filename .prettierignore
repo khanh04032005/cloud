@@ -10,3 +10,6 @@ pnpm-lock.yaml
 /packages/e2e/test-results
 /packages/e2e/playwright-report
 /coverage
+
+# Helm Go templates are checked by helm lint and rendered-manifest tests.
+/deploy/helm/razzia/templates

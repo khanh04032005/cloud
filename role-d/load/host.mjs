@@ -165,6 +165,15 @@ function watchRoom(room, { expected, waitMs, advanceDelay, maxGameMs }) {
       await sleep(500)
     }
 
+    if (room.players === 0) {
+      // locking an empty room makes every later join fail with 403 game.locked
+      console.error(
+        `Hết WAIT_MS mà phòng ${room.inviteCode} chưa có ai. Không khoá phòng, thoát. ` +
+          `Chạy k6 sớm hơn hoặc tăng WAIT_MS.`,
+      )
+      process.exit(1)
+    }
+
     console.log(`start ${room.inviteCode} with ${room.players}/${expected} players`)
     room.client.emit("manager:setLock", { gameId: room.gameId, locked: true })
     room.client.emit("manager:startGame", { gameId: room.gameId })
@@ -235,6 +244,9 @@ async function main() {
     room.client.close()
     console.log(`finished ${room.inviteCode}`)
   }
+
+  // the MAX_GAME_MS cap timer would keep the process alive for up to 10 minutes
+  process.exit(0)
 }
 
 main().catch((error) => {

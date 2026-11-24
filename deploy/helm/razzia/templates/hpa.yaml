@@ -1,0 +1,26 @@
+{{- if .Values.apps.socket.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "razzia.fullname" . }}-socket
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "razzia.labels" (dict "root" . "component" "socket") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "razzia.fullname" . }}-socket
+  minReplicas: {{ .Values.apps.socket.hpa.minReplicas }}
+  maxReplicas: {{ .Values.apps.socket.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.apps.socket.hpa.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: {{ .Values.apps.socket.hpa.scaleDownStabilizationSeconds }}
+{{- end }}

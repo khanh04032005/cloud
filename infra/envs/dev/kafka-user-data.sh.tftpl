@@ -1,0 +1,51 @@
+#!/bin/bash
+# user_data cho máy Kafka. Log nằm ở /var/log/cloud-init-output.log (xem qua SSM).
+set -euxo pipefail
+
+KAFKA_VERSION=3.9.1
+export KAFKA_HOME=/opt/kafka
+
+dnf install -y java-21-amazon-corretto-headless
+
+curl -fsSL "https://archive.apache.org/dist/kafka/$${KAFKA_VERSION}/kafka_2.13-$${KAFKA_VERSION}.tgz" -o /tmp/kafka.tgz
+mkdir -p "$KAFKA_HOME"
+tar -xzf /tmp/kafka.tgz -C "$KAFKA_HOME" --strip-components=1
+
+mkdir -p /opt/razzia-kafka
+cat > /opt/razzia-kafka/server.properties.example <<'PROPS'
+${server_properties}
+PROPS
+cat > /opt/razzia-kafka/setup-ec2.sh <<'SETUP'
+${setup_script}
+SETUP
+
+TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+export PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+bash /opt/razzia-kafka/setup-ec2.sh
+
+# 2 GiB RAM: giới hạn heap để không bị OOM.
+cat > /etc/systemd/system/kafka.service <<UNIT
+[Unit]
+Description=Kafka (KRaft, single node)
+After=network-online.target
+
+[Service]
+Environment=KAFKA_HEAP_OPTS=-Xms512m -Xmx1g
+ExecStart=$KAFKA_HOME/bin/kafka-server-start.sh $KAFKA_HOME/config/razzia-server.properties
+Restart=on-failure
+LimitNOFILE=100000
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now kafka
+
+# Chờ broker lên rồi tạo topic answers, 3 partition (partition theo roomId).
+for _ in $(seq 1 30); do
+  "$KAFKA_HOME/bin/kafka-topics.sh" --bootstrap-server localhost:9092 --list && break
+  sleep 5
+done
+"$KAFKA_HOME/bin/kafka-topics.sh" --bootstrap-server localhost:9092 \
+  --create --if-not-exists --topic answers --partitions 3 --replication-factor 1

@@ -172,25 +172,31 @@ export class Cloud {
   }
 
   async saveLobby(game: Game) {
-    await withLease(this, game.lease, (client) =>
-      client.query(
-        "UPDATE rooms SET settings = $2, locked = $3 WHERE id = $1",
-        [game.gameId, game.settings, game.locked],
-      ),
+    await withLease(
+      this,
+      { gameId: game.gameId, lease: game.lease },
+      (client) =>
+        client.query(
+          "UPDATE rooms SET settings = $2, locked = $3 WHERE id = $1",
+          [game.gameId, game.settings, game.locked],
+        ),
     )
   }
 
   async prunePlayers(game: Game) {
-    await withLease(this, game.lease, (client) =>
-      client.query(
-        "UPDATE players SET active = false, connected = false WHERE room_id = $1 AND NOT (id = ANY($2::uuid[]))",
-        [game.gameId, game.players.map(({ clientId }) => clientId)],
-      ),
+    await withLease(
+      this,
+      { gameId: game.gameId, lease: game.lease },
+      (client) =>
+        client.query(
+          "UPDATE players SET active = false, connected = false WHERE room_id = $1 AND NOT (id = ANY($2::uuid[]))",
+          [game.gameId, game.players.map(({ clientId }) => clientId)],
+        ),
     )
   }
 
   async savePlayer(gameId: string, player: Player, lease?: RoomLease) {
-    await withLease(this, lease, (client) =>
+    await withLease(this, { gameId, lease }, (client) =>
       client.query(
         `INSERT INTO players (room_id, id, username, socket_id, connected) VALUES ($1, $2, $3, $4, true)
        ON CONFLICT (room_id, id) DO UPDATE SET username = EXCLUDED.username, socket_id = EXCLUDED.socket_id, connected = true, active = true`,
@@ -209,7 +215,7 @@ export class Cloud {
     lease?: RoomLease,
   ) {
     const { phase, position = 0, closesAt = null } = state
-    const changed = await withLease(this, lease, (client) => {
+    const changed = await withLease(this, { gameId, lease }, (client) => {
       if (phase === "running" || phase === "finished") {
         return client.query(
           `UPDATE rooms SET status = $2, finished_at = CASE WHEN $2 = 'finished' THEN COALESCE(finished_at, now()) ELSE NULL END
@@ -256,7 +262,7 @@ export class Cloud {
   }
 
   async removeRoom(gameId: string, lease?: RoomLease) {
-    await withLease(this, lease, (client) =>
+    await withLease(this, { gameId, lease }, (client) =>
       client.query(
         `WITH cancelled AS (
          UPDATE rooms SET status = 'cancelled' WHERE id = $1 AND status IN ('lobby', 'running') RETURNING id

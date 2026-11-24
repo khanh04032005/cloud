@@ -15,11 +15,8 @@ await runWorker("razzia-score", 9102, async (raw) => {
   }
 
   await redis.publish(
-    `razzia:leaderboard:${result.roomId}`,
-    JSON.stringify({
-      roomId: result.roomId,
-      players: result.leaderboard,
-    }),
+    "razzia:leaderboard",
+    JSON.stringify({ room_id: result.roomId }),
   )
   inc(
     result.isNew

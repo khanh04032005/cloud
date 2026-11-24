@@ -1,37 +1,13 @@
-# Hợp đồng schema — đề xuất của vai D
+# Hợp đồng schema D
 
-A chưa đẩy migration. Các file SQL trong `db/` là hợp đồng để Lambda và câu đối chiếu điểm biên dịch được. Nếu A đổi tên cột, chỉ sửa `lambda/export-results/logic.mjs` và `db/011_score_audit.sql`.
+Nguồn chuẩn duy nhất: [database-schema.md](../../docs/database-schema.md) và migration 001–007 tại packages/socket/migrations.
 
-## Đã chốt với B (không đổi)
+- Import ghi catalog quizzes/questions của A. questions.position bắt đầu từ 1, definition JSONB giữ nguyên nội dung câu hỏi.
+- quiz_imports chỉ giữ metadata S3 bucket/key/ETag, SHA-256, license và quiz_id. Không có question_sets hoặc bản sao document.
+- room_id, round_id, player_id là UUID. player_id là clientId ổn định, không phải socket ID.
+- answers.choice là integer hoặc null; answer_keys là mảng. event_id lấy từ outbox, không phải answers.
+- Điểm ở results; marker tính điểm ở processed_answer_events. Tên người chơi là players.username.
+- Export dùng snapshot REPEATABLE READ, gồm cả người không trả lời; ranking tách theo phòng.
+- Audit view được tạo bằng migration 007. Chạy experiments/score-audit.sql sau khi worker xử lý hết: sai điểm, thiếu result/outbox/marker đều phải bằng 0.
 
-Event `answer_accepted`, topic `answers`, key `room_id`:
-
-```json
-{
-  "event_id": "uuid",
-  "room_id": "text",
-  "round_id": "text",
-  "player_id": "text",
-  "choice": [1],
-  "is_correct": true,
-  "accepted_at": "2026-10-31T12:00:00.250Z"
-}
-```
-
-`player_id` là `clientId`, không phải socket id. Bảng `player_scores(room_id, player_id, points)` và `outbox` thuộc B. Điểm đúng là 1, điểm sai là 0.
-
-## D tạo và sở hữu
-
-`db/010_question_sets.sql`: `question_sets`, `questions`. Lambda nạp câu hỏi ghi hai bảng này trong một transaction. Cùng `(s3_bucket, s3_key, s3_etag)` thì lần ghi sau bị bỏ qua.
-
-## D cần A tạo
-
-`db/000_proposed_for_A.sql`: `rooms`, `players`, `rounds`, `answers`.
-
-`answers` có `PRIMARY KEY (round_id, player_id)` và `event_id` duy nhất. `choice` là JSON mảng số, cùng kiểu với field `choice` của B.
-
-`question_sets.id` là đích của `rooms.question_set_id`. Cột đó để nullable cho đến khi A nối phòng với bộ câu hỏi.
-
-## Đối chiếu điểm
-
-Sau khi A và B đã tạo bảng, chạy `db/011_score_audit.sql` rồi `experiments/score-audit.sql`. `point_delta` khác 0 là lỗi. Razzia 4.0.2 vẫn tính điểm theo thời gian trong bộ nhớ, nên câu SQL này chỉ có nghĩa sau khi pipeline 1 điểm/câu của A và B chạy thật.
+Đã bỏ các SQL đề xuất riêng trong db/ để tránh tạo bảng trùng hoặc một schema khác với ứng dụng.

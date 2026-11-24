@@ -75,10 +75,16 @@ export const assertLease = async (client: PoolClient, lease?: RoomLease) => {
 
 export const withLease = <T>(
   storage: Cloud,
-  lease: RoomLease | undefined,
+  target: { gameId: string; lease: RoomLease | undefined },
   run: (_client: PoolClient) => Promise<T>,
 ) =>
   storage.transaction(async (client) => {
+    const { gameId, lease } = target
+
+    if (lease?.gameId !== gameId) {
+      throw new LeaseLost(gameId)
+    }
+
     await assertLease(client, lease)
 
     return run(client)

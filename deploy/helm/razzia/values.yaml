@@ -1,0 +1,149 @@
+# Required at deployment: ECR prefix including /razzia, and an immutable image tag.
+# Example: 123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/razzia
+image:
+  registry: ""
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Created before Helm runs; never put passwords in this file.
+secretName: razzia-env
+nameOverride: ""
+fullnameOverride: ""
+nodeSelector: {}
+tolerations: []
+# Bump when changing the external Secret so deployments restart with the new env.
+configRevision: ""
+
+ingress:
+  enabled: true
+  className: alb
+  host: ""
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+  # For HTTPS, add certificate-arn, listen-ports and ssl-redirect annotations.
+
+monitoring:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 10s
+  # kube-prometheus-stack release selector, override for another installation.
+  labels:
+    release: kps
+
+migration:
+  enabled: true
+  image: migrate
+  activeDeadlineSeconds: 300
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  resources:
+    requests: { cpu: 50m, memory: 32Mi }
+    limits: { memory: 128Mi }
+
+apps:
+  web:
+    image: web
+    port: 3000
+    replicas: 2
+    secretKeys: []
+    env: {}
+    probe: { live: /, ready: / }
+    preStopSeconds: 15
+    terminationGracePeriodSeconds: 45
+    # The current nginx image starts its master as root and drops worker privileges.
+    securityContext: { allowPrivilegeEscalation: false }
+    podSecurityContext: {}
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+
+  socket:
+    image: socket
+    port: 3001
+    replicas: 2
+    secretKeys: [DATABASE_URL, REDIS_URL, JWT_SECRET, MANAGER_PASSWORD]
+    env:
+      ROOM_LEASE_TTL_MS: "9000"
+      GAME_SPEED: "1"
+    probe: { live: /health/live, ready: /health/ready }
+    metrics: true
+    preStopSeconds: 15
+    terminationGracePeriodSeconds: 60
+    podSecurityContext: { fsGroup: 1000 }
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: { drop: [ALL] }
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { memory: 512Mi }
+    hpa:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 60
+      scaleDownStabilizationSeconds: 120
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+  publisher:
+    image: worker
+    command: [node, src/publisher.mjs]
+    port: 9101
+    replicas: 1
+    secretKeys: [DATABASE_URL, KAFKA_BROKERS]
+    env:
+      KAFKA_TOPIC: answers
+      OUTBOX_POLL_MS: "500"
+      OUTBOX_BATCH_SIZE: "100"
+    metrics: true
+    preStopSeconds: 0
+    terminationGracePeriodSeconds: 45
+    podSecurityContext: {}
+    securityContext: &workerSecurity
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities: { drop: [ALL] }
+    resources: &workerResources
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { memory: 256Mi }
+
+  score:
+    image: worker
+    command: [node, src/score-worker.mjs]
+    port: 9102
+    replicas: 1
+    secretKeys: [DATABASE_URL, REDIS_URL, KAFKA_BROKERS]
+    env: { KAFKA_TOPIC: answers }
+    metrics: true
+    preStopSeconds: 0
+    terminationGracePeriodSeconds: 45
+    podSecurityContext: {}
+    securityContext: *workerSecurity
+    resources: *workerResources
+
+  stats:
+    image: worker
+    command: [node, src/stats-worker.mjs]
+    port: 9103
+    replicas: 1
+    secretKeys: [DATABASE_URL, REDIS_URL, KAFKA_BROKERS]
+    env: { KAFKA_TOPIC: answers, STATS_DEDUP_MODE: bloom }
+    metrics: true
+    preStopSeconds: 0
+    terminationGracePeriodSeconds: 45
+    podSecurityContext: {}
+    securityContext: *workerSecurity
+    resources: *workerResources

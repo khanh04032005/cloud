@@ -14,20 +14,20 @@ MVP của môn: câu trắc nghiệm một đáp án đúng, đúng được 1 �
 
 Cách xếp theo đề bài, không theo brochure của AWS.
 
-| Thành phần | Nhóm dùng nó để | Loại | Vì sao |
-| --- | --- | --- | --- |
-| EC2 worker của EKS | Chạy pod web, socket, worker | IaaS | Nhóm chọn cỡ máy, AZ, và vẫn thấy VM. Hypervisor là của AWS (C viết). |
-| EC2 Kafka | Broker KRaft một node | IaaS | Tự cài Kafka 3.9, không dùng MSK trong phần làm. MSK chỉ đưa vào phần so sánh. |
-| EC2 phát tải | Chạy k6 | IaaS | Tách khỏi cụm để CPU của k6 không bị ghi nhầm thành CPU của quiz. |
-| EKS | Điều khiển replica, probe, HPA | Dịch vụ managed | Control plane do AWS chạy. Node bên dưới vẫn là EC2. |
-| RDS PostgreSQL | Phòng, đáp án, outbox, điểm | Dịch vụ managed (PaaS cơ sở dữ liệu) | AWS vá máy, backup, storage. Schema và SQL là của nhóm. |
-| ALB | HTTP và WebSocket | Dịch vụ managed | Nhóm không tự chạy Nginx trên EC2 cho đường vào. |
-| Lambda | Nạp câu hỏi, xuất CSV | FaaS | Không giữ process. Chạy khi có file hoặc khi gọi invoke. |
-| S3 | File câu hỏi, CSV kết quả | Object storage | Không phải đĩa gắn vào pod. |
-| ECR | Image | Registry managed | |
-| ElastiCache hoặc Redis trên EC2 | Adapter Socket.IO, lease, HyperLogLog | Managed nếu là ElastiCache, IaaS nếu C cài trên EC2 | C chốt kiểu triển khai. Báo cáo ghi đúng cái đã apply, không đoán. |
-| Prometheus + Grafana trên cụm | Metric ứng dụng | Phần mềm tự chạy trên EKS | Khác CloudWatch, vốn là dịch vụ managed. |
-| Sản phẩm quiz với giảng viên và người chơi | Họ chỉ mở trình duyệt | SaaS đối với người dùng cuối | Họ không thấy EC2, pod, hay Kafka. |
+| Thành phần                                 | Nhóm dùng nó để                       | Loại                                                | Vì sao                                                                         |
+| ------------------------------------------ | ------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------ |
+| EC2 worker của EKS                         | Chạy pod web, socket, worker          | IaaS                                                | Nhóm chọn cỡ máy, AZ, và vẫn thấy VM. Hypervisor là của AWS (C viết).          |
+| EC2 Kafka                                  | Broker KRaft một node                 | IaaS                                                | Tự cài Kafka 3.9, không dùng MSK trong phần làm. MSK chỉ đưa vào phần so sánh. |
+| EC2 phát tải                               | Chạy k6                               | IaaS                                                | Tách khỏi cụm để CPU của k6 không bị ghi nhầm thành CPU của quiz.              |
+| EKS                                        | Điều khiển replica, probe, HPA        | Dịch vụ managed                                     | Control plane do AWS chạy. Node bên dưới vẫn là EC2.                           |
+| RDS PostgreSQL                             | Phòng, đáp án, outbox, điểm           | Dịch vụ managed (PaaS cơ sở dữ liệu)                | AWS vá máy, backup, storage. Schema và SQL là của nhóm.                        |
+| ALB                                        | HTTP và WebSocket                     | Dịch vụ managed                                     | Nhóm không tự chạy Nginx trên EC2 cho đường vào.                               |
+| Lambda                                     | Nạp câu hỏi, xuất CSV                 | FaaS                                                | Không giữ process. Chạy khi có file hoặc khi gọi invoke.                       |
+| S3                                         | File câu hỏi, CSV kết quả             | Object storage                                      | Không phải đĩa gắn vào pod.                                                    |
+| ECR                                        | Image                                 | Registry managed                                    |                                                                                |
+| ElastiCache hoặc Redis trên EC2            | Adapter Socket.IO, lease, HyperLogLog | Managed nếu là ElastiCache, IaaS nếu C cài trên EC2 | C chốt kiểu triển khai. Báo cáo ghi đúng cái đã apply, không đoán.             |
+| Prometheus + Grafana trên cụm              | Metric ứng dụng                       | Phần mềm tự chạy trên EKS                           | Khác CloudWatch, vốn là dịch vụ managed.                                       |
+| Sản phẩm quiz với giảng viên và người chơi | Họ chỉ mở trình duyệt                 | SaaS đối với người dùng cuối                        | Họ không thấy EC2, pod, hay Kafka.                                             |
 
 Một dịch vụ managed không có nghĩa là hết việc vận hành. RDS vẫn cần lớp lưu trữ, backup và security group. EKS vẫn cần node và giới hạn CPU. Lambda trong VPC vẫn lạnh hơn Lambda ngoài VPC, và vẫn phụ thuộc số kết nối của RDS.
 
@@ -57,17 +57,17 @@ Tag bắt buộc, C gắn lên mọi resource, D đã gắn default tag `Project
 
 Đơn giá lấy từ AWS Pricing Calculator đúng region, đúng ngày nhóm apply. Không chép đơn giá từ tài liệu cũ vào bài nộp. Bảng dưới là chỗ điền.
 
-| Hạng mục | Đơn giá | Số lượng | Số giờ | Thành tiền | Nguồn |
-| --- | --- | --- | --- | --- | --- |
-| EKS control plane |  | 1 |  |  | Calculator, ngày … |
-| NAT gateway |  | 1 |  |  |  |
-| Dữ liệu NAT xử lý |  | GB |  |  |  |
-| EC2 worker |  | ≥ 2 |  |  | loại instance C chọn |
-| RDS |  | 1 |  |  |  |
-| EC2 Kafka |  | 1 |  |  |  |
-| EC2 k6 |  | 1 |  |  |  |
-| ALB + LCU |  |  |  |  |  |
-| S3 + Lambda |  |  |  |  | thường nhỏ, vẫn ghi |
+| Hạng mục          | Đơn giá | Số lượng | Số giờ | Thành tiền | Nguồn                |
+| ----------------- | ------- | -------- | ------ | ---------- | -------------------- |
+| EKS control plane |         | 1        |        |            | Calculator, ngày …   |
+| NAT gateway       |         | 1        |        |            |                      |
+| Dữ liệu NAT xử lý |         | GB       |        |            |                      |
+| EC2 worker        |         | ≥ 2      |        |            | loại instance C chọn |
+| RDS               |         | 1        |        |            |                      |
+| EC2 Kafka         |         | 1        |        |            |                      |
+| EC2 k6            |         | 1        |        |            |                      |
+| ALB + LCU         |         |          |        |            |                      |
+| S3 + Lambda       |         |          |        |            | thường nhỏ, vẫn ghi  |
 
 Một buổi tối bật cụm rồi quên tắt có thể đắt hơn cả chục lần chạy k6. Cảnh báo AWS Budgets là của C. D ghi vào báo cáo số tiền của từng `RunId` sau khi số liệu Cost Explorer xuất hiện (thường trễ vài giờ đến một ngày).
 
@@ -86,9 +86,9 @@ Upload lại cùng nội dung giữ nguyên ETag thì Lambda không tạo bộ c
 
 ### RDS
 
-D giữ `question_sets` và `questions`. A giữ phòng, vòng, người chơi, đáp án. B giữ outbox, điểm và khóa chống xử lý trùng. Sơ đồ và lý do từng cột nằm ở `docs/hop-dong-schema.md`.
+D import vào catalog `quizzes`/`questions` chung của A, giữ provenance S3 trong `quiz_imports`. A ghi phòng, vòng, người chơi, đáp án và outbox. B ghi điểm vào `results` và marker `processed_answer_events`. Sơ đồ và lý do từng cột nằm ở `docs/hop-dong-schema.md`.
 
-File JSON Razzia vẫn được lưu nguyên trong `question_sets.document` để A còn nạp được đúng format editor, không chỉ các cột đã tách.
+Mỗi câu hỏi giữ nguyên trong `questions.definition` JSONB theo format editor. Metadata S3 được tách riêng; không lưu thêm bản sao document.
 
 ### Bộ câu hỏi
 
@@ -100,7 +100,7 @@ Khi phát lại bộ câu hoặc trích câu trong báo cáo thì ghi công Open
 
 Hai hàm, runtime Node.js 20, 256 MB.
 
-**Nạp câu hỏi.** S3 gọi khi có `ObjectCreated` dưới `imports/`, đuôi `.json`. Hàm tải object, kiểm tra đúng luật Razzia (2–4 đáp án, cooldown 3–15, một `solutions`), rồi ghi `question_sets` và `questions` trong một transaction. Sai định dạng thì hàm lỗi và S3 có thể gọi lại. Lỗi trùng khóa duy nhất thì coi là đã nạp, không lỗi.
+**Nạp câu hỏi.** S3 gọi khi có `ObjectCreated` dưới `imports/`, đuôi `.json`. Hàm tải object, kiểm tra đúng luật Razzia (2–4 đáp án, cooldown 3–15, một `solutions`), rồi ghi `quizzes`, `questions` và `quiz_imports` trong một transaction. Sai định dạng thì hàm lỗi và S3 có thể gọi lại. Chỉ trùng bộ bucket/key/ETag mới được coi là đã nạp; lỗi SQL khác được trả ra để retry.
 
 **Xuất kết quả.** Gọi bằng invoke, body `{ "roomId": "..." }`. Bỏ `roomId` thì xuất mọi phòng. Hai CSV: bảng điểm có hạng, và từng đáp án đã nhận. Hạng là hạng cuộc thi: điểm 3, 3, 1 thành hạng 1, 1, 3. Hàm trả về số người có `points` khác số câu đúng.
 

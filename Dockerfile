@@ -13,12 +13,19 @@ COPY packages/common/package.json ./packages/common/
 COPY packages/web/package.json ./packages/web/
 COPY packages/socket/package.json ./packages/socket/
 COPY packages/e2e/package.json ./packages/e2e/
+COPY packages/streaming/package.json ./packages/streaming/
 
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 
 COPY . .
 
 RUN pnpm build
+
+# Streaming chỉ là JS thuần (không cần build): gom code + dependency production vào /out/streaming.
+# --legacy vì streaming không phụ thuộc workspace package nào, không cần inject-workspace-packages.
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
+    pnpm --filter @razzia/streaming deploy --prod --legacy /out/streaming \
+    && rm -f /out/streaming/src/*.test.mjs /out/streaming/scripts/*.test.mjs
 
 # ---- WEB ----
 FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS nginx-runtime
@@ -44,6 +51,30 @@ COPY --from=builder /app/packages/socket/dist/index.cjs /app/socket/index.cjs
 EXPOSE 3001
 
 CMD ["node", "/app/socket/index.cjs"]
+
+# ---- STREAMING WORKER ----
+# publisher / score-worker / stats-worker dùng chung image, khác nhau ở command
+# (compose hoặc Helm đặt). Metric: publisher 9101, score 9102, stats 9103.
+FROM node-runtime AS worker
+WORKDIR /app
+
+ENV NODE_ENV=production
+COPY --from=builder --chown=node:node /out/streaming /app
+USER node
+
+CMD ["node", "src/score-worker.mjs"]
+
+# ---- DB MIGRATION ----
+# Chạy một lần trước khi socket khởi động: compose service `migrate`, trên EKS là Helm hook Job.
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS migrate
+RUN apk add --no-cache postgresql-client
+
+COPY packages/socket/migrations /migrations
+COPY --chmod=755 docker/migrate.sh /usr/local/bin/migrate
+RUN sed -i 's/\r$//' /usr/local/bin/migrate
+
+USER nobody
+CMD ["migrate", "/migrations"]
 
 # ---- COMBINED RUNNER ----
 FROM nginx-runtime AS runner

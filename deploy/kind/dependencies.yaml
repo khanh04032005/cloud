@@ -1,0 +1,229 @@
+# Disposable dependencies for the local kind cluster only; never apply to EKS.
+# PostgreSQL credentials match compose.full.yml and are for local testing only.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: razzia-test
+  labels:
+    app.kubernetes.io/part-of: razzia-kind-test
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: razzia-test
+spec:
+  clusterIP: None
+  selector: { app: razzia-kind-postgres }
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: razzia-test
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: razzia-kind-postgres }
+  template:
+    metadata:
+      labels: { app: razzia-kind-postgres }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - { name: POSTGRES_DB, value: razzia }
+            - { name: POSTGRES_USER, value: razzia }
+            - { name: POSTGRES_PASSWORD, value: razzia }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          startupProbe:
+            exec: { command: [pg_isready, -U, razzia, -d, razzia] }
+            periodSeconds: 2
+            failureThreshold: 90
+          readinessProbe:
+            exec: { command: [pg_isready, -U, razzia, -d, razzia] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: { storage: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: razzia-test
+spec:
+  selector: { app: razzia-kind-redis }
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: razzia-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: razzia-kind-redis }
+  template:
+    metadata:
+      labels: { app: razzia-kind-redis }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: [redis-server, --save, "", --appendonly, "no"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec: { command: [redis-cli, ping] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: razzia-test
+spec:
+  clusterIP: None
+  selector: { app: razzia-kind-kafka }
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: razzia-test
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels: { app: razzia-kind-kafka }
+  template:
+    metadata:
+      labels: { app: razzia-kind-kafka }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.1
+          ports:
+            - name: kafka
+              containerPort: 9092
+          env:
+            - { name: CLUSTER_ID, value: MkU3OEVBNTcwNTJENDM2Qk }
+            - { name: KAFKA_NODE_ID, value: "1" }
+            - { name: KAFKA_PROCESS_ROLES, value: "broker,controller" }
+            - {
+                name: KAFKA_CONTROLLER_QUORUM_VOTERS,
+                value: "1@localhost:9093",
+              }
+            - {
+                name: KAFKA_LISTENERS,
+                value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://localhost:9093",
+              }
+            - {
+                name: KAFKA_ADVERTISED_LISTENERS,
+                value: "PLAINTEXT://kafka.razzia-test.svc.cluster.local:9092",
+              }
+            - {
+                name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP,
+                value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT",
+              }
+            - { name: KAFKA_INTER_BROKER_LISTENER_NAME, value: PLAINTEXT }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: CONTROLLER }
+            - { name: KAFKA_LOG_DIRS, value: /var/lib/kafka/data/logs }
+            - { name: KAFKA_NUM_PARTITIONS, value: "3" }
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1" }
+            - {
+                name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR,
+                value: "1",
+              }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "1" }
+            - { name: KAFKA_AUTO_CREATE_TOPICS_ENABLE, value: "false" }
+            - { name: KAFKA_HEAP_OPTS, value: "-Xms256m -Xmx512m" }
+          startupProbe:
+            tcpSocket: { port: kafka }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: { port: kafka }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: { storage: 1Gi }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-init
+  namespace: razzia-test
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 2
+  template:
+    metadata:
+      labels: { app: razzia-kind-kafka-init }
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: kafka-init
+          image: apache/kafka:3.9.1
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              until /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list; do
+                sleep 5
+              done
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+                --create --if-not-exists --topic answers --partitions 3 --replication-factor 1
+          env:
+            - { name: KAFKA_HEAP_OPTS, value: "-Xms64m -Xmx128m" }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }

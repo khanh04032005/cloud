@@ -1,0 +1,41 @@
+name: Helm
+
+on:
+  pull_request:
+    paths:
+      - "deploy/helm/**"
+      - "deploy/kind/**"
+      - "scripts/test-helm.sh"
+      - "scripts/setup-helm.sh"
+      - "scripts/aws/up.sh"
+      - "scripts/aws/common.sh"
+      - ".github/workflows/helm.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Helm and test dependencies
+        run: |
+          curl --fail --location --output "$RUNNER_TEMP/helm.tar.gz" https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz
+          echo "a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496  $RUNNER_TEMP/helm.tar.gz" > "$RUNNER_TEMP/helm.sha256"
+          sha256sum --check "$RUNNER_TEMP/helm.sha256"
+          tar -xzf "$RUNNER_TEMP/helm.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/linux-amd64" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/helm-tests"
+          "$RUNNER_TEMP/helm-tests/bin/pip" install -r deploy/helm/tests/requirements.txt
+          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Check chart and deployment contracts
+        env:
+          PYTHON: ${{ runner.temp }}/helm-tests/bin/python
+          KUBECONFORM: kubeconform
+        run: bash scripts/test-helm.sh

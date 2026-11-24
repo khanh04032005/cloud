@@ -169,7 +169,10 @@ class Game {
   }
 
   attachLease(lease: RoomLease) {
-    if (this._lease && this._lease.token !== lease.token) {
+    if (
+      lease.gameId !== this.gameId ||
+      (this._lease && this._lease.token !== lease.token)
+    ) {
       throw new LeaseLost(this.gameId)
     }
 
@@ -179,7 +182,9 @@ class Game {
 
   async assertOwner() {
     if (cloud) {
-      await withLease(cloud, this.lease, () => Promise.resolve())
+      await withLease(cloud, { gameId: this.gameId, lease: this.lease }, () =>
+        Promise.resolve(),
+      )
     }
   }
 

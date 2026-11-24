@@ -3,13 +3,16 @@
  *  Plain ESM so both Node and k6 can import it.
  */
 
+// k6 has no global URL, so parse by hand: keep scheme + host[:port], drop path/query/hash.
 export function engineUrl(baseUrl) {
-  const url = new URL(baseUrl)
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
-  url.pathname = "/ws/"
-  url.search = "EIO=4&transport=websocket"
-  url.hash = ""
-  return url.toString()
+  const match = /^(https?):\/\/([^/?#]+)/i.exec(String(baseUrl).trim())
+
+  if (!match) {
+    throw new Error(`BASE_URL không hợp lệ: ${baseUrl}`)
+  }
+
+  const scheme = match[1].toLowerCase() === "https" ? "wss" : "ws"
+  return `${scheme}://${match[2]}/ws/?EIO=4&transport=websocket`
 }
 
 export function encodeConnect(auth) {

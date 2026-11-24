@@ -1,0 +1,25 @@
+{{- range $name, $app := .Values.apps }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "razzia.fullname" $ }}-{{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "razzia.labels" (dict "root" $ "component" $name) | nindent 4 }}
+  {{- if or (eq $name "web") (eq $name "socket") }}
+  annotations:
+    alb.ingress.kubernetes.io/healthcheck-path: {{ $app.probe.ready | quote }}
+    alb.ingress.kubernetes.io/healthcheck-port: traffic-port
+    alb.ingress.kubernetes.io/success-codes: "200"
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "razzia.selectorLabels" (dict "root" $ "component" $name) | nindent 4 }}
+  ports:
+    - name: {{ if or (eq $name "web") (eq $name "socket") }}http{{ else }}metrics{{ end }}
+      port: {{ $app.port }}
+      targetPort: {{ if or (eq $name "web") (eq $name "socket") }}http{{ else }}metrics{{ end }}
+      protocol: TCP
+{{- end }}

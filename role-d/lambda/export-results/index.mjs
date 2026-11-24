@@ -3,10 +3,10 @@ import pg from "pg"
 import {
   ANSWER_HEADERS,
   RESULTS_HEADERS,
-  answersSql,
   assignRanks,
   exportKeys,
-  resultsSql,
+  hasScoreMismatch,
+  readExportSnapshot,
   shapeAnswerRow,
   toCsv,
 } from "./logic.mjs"
@@ -23,7 +23,8 @@ function getPool() {
     pool = new pg.Pool({
       connectionString: process.env.DATABASE_URL,
       max: 1,
-      ssl: process.env.PGSSL === "disable" ? false : { rejectUnauthorized: true },
+      ssl:
+        process.env.PGSSL === "disable" ? false : { rejectUnauthorized: true },
     })
   }
 
@@ -41,10 +42,9 @@ export async function handler(event = {}) {
   const client = await getPool().connect()
 
   try {
-    const scores = await client.query(resultsSql(roomId))
-    const answers = await client.query(answersSql(roomId))
+    const { scores, answers } = await readExportSnapshot(client, roomId)
     const ranked = assignRanks(
-      scores.rows.map((row) => ({
+      scores.map((row) => ({
         ...row,
         points: Number(row.points),
         correct_answers: Number(row.correct_answers),
@@ -53,7 +53,7 @@ export async function handler(event = {}) {
     )
     const keys = exportKeys(roomId)
     const resultsBody = toCsv(RESULTS_HEADERS, ranked)
-    const answersBody = toCsv(ANSWER_HEADERS, answers.rows.map(shapeAnswerRow))
+    const answersBody = toCsv(ANSWER_HEADERS, answers.map(shapeAnswerRow))
 
     await s3.send(
       new PutObjectCommand({
@@ -72,13 +72,13 @@ export async function handler(event = {}) {
       }),
     )
 
-    const mismatches = ranked.filter((row) => row.points !== row.correct_answers)
+    const mismatches = ranked.filter(hasScoreMismatch)
 
     return {
       bucket,
       keys,
       players: ranked.length,
-      answers: answers.rows.length,
+      answers: answers.length,
       mismatches: mismatches.length,
     }
   } finally {

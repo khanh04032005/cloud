@@ -14,7 +14,11 @@ import {
 } from "@razzia/common/types/game/status"
 import type { GameSocket } from "@razzia/socket/handlers/types"
 import type { Cloud } from "@razzia/socket/services/cloud"
-import { withLease, type RoomLease } from "@razzia/socket/services/leases"
+import {
+  LeaseLost,
+  withLease,
+  type RoomLease,
+} from "@razzia/socket/services/leases"
 import { QUESTION_SCORING } from "@razzia/socket/services/scoring"
 import type { ScoredPlayer } from "@razzia/socket/services/scoring/round"
 import { SECOND_MS } from "@razzia/socket/utils/sleep"
@@ -102,11 +106,19 @@ export class CloudGame {
   }
 
   attachLease(lease: RoomLease) {
+    if (lease.gameId !== this.gameId) {
+      throw new LeaseLost(this.gameId)
+    }
+
     this.lease = lease
   }
 
   private transaction<T>(run: (_client: PoolClient) => Promise<T>) {
-    return withLease(this.storage, this.lease, run)
+    return withLease(
+      this.storage,
+      { gameId: this.gameId, lease: this.lease },
+      run,
+    )
   }
 
   private write(run: () => Promise<void>) {

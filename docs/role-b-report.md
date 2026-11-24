@@ -10,7 +10,7 @@ Mỗi event mang `event_id`, `room_id`, `round_id`, `player_id`, `choice`, `is_c
 
 Publisher khóa các hàng outbox chưa gửi bằng `FOR UPDATE SKIP LOCKED`, gửi với `acks=all`, rồi đánh dấu `published_at`. Nếu publisher bị dừng sau khi broker nhận event nhưng trước khi PostgreSQL commit, event có thể được gửi lại. Consumer chỉ commit Kafka offset sau khi xử lý thành công; do đó hệ thống dùng ngữ nghĩa **at least once** ở đường đi này. [Tài liệu thiết kế Kafka](https://kafka.apache.org/41/design/design/) cũng nêu khả năng gửi lại khi producer không biết request trước đã thành công hay chưa.
 
-Để không cộng điểm hai lần, score worker ghi `event_id` vào `score_processed_events` có khóa duy nhất trong cùng transaction với cập nhật `player_scores`. Đáp án đúng cộng 1 điểm, đáp án sai cộng 0 điểm, không xét thời gian. Stats worker dùng khóa duy nhất tương tự cho bảng `answer_rate_buckets`. Sau khi commit DB, score worker phát snapshot leaderboard qua Redis; nếu việc phát Redis lỗi, Kafka offset chưa commit nên worker thử lại mà không cộng điểm trùng.
+Để không cộng điểm hai lần, score worker ghi `event_id` vào `processed_answer_events` có khóa duy nhất trong cùng transaction với cập nhật `results`. Đáp án đúng cộng 1 điểm, đáp án sai cộng 0 điểm, không xét thời gian. Stats worker dùng khóa duy nhất tương tự cho bảng `answer_rate_buckets`. Sau khi commit DB, score worker phát notification room_id qua Redis để gateway đọc results; nếu việc phát Redis lỗi, Kafka offset chưa commit nên worker thử lại mà không cộng điểm trùng.
 
 ## Thống kê luồng
 

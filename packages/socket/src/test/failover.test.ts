@@ -242,6 +242,54 @@ it("takes over a killed coordinator without resetting the round or duplicating a
       "SELECT owner_token, owner_epoch, closes_at FROM rooms JOIN rounds ON rounds.room_id = rooms.id WHERE rounds.id = $1",
       [roundId],
     )
+    await applyScoreFixture(pool, gameId)
+    const committed = await pool.query<Record<string, unknown>>(
+      "SELECT a.*, o.event_id FROM answers a JOIN outbox o USING (round_id, player_id) WHERE a.room_id = $1 ORDER BY a.round_id, a.player_id",
+      [gameId],
+    )
+    expect(committed.rows).toHaveLength(1)
+    const committedScore = (
+      await pool.query<{ points: number }>(
+        "SELECT points FROM results WHERE room_id = $1",
+        [gameId],
+      )
+    ).rows
+    expect(committedScore).toEqual([{ points: 1 }])
+
+    await json(CLOUD_TEST_B, `/api/quizz/${quiz.id}`, {
+      token: hostToken,
+      method: "PATCH",
+      data: {
+        gameMode: "survey",
+        subject: "Catalog mode changed",
+        questions: [
+          {
+            type: "single",
+            question: "Edited",
+            answers: ["Yes", "No"],
+            solutions: [1],
+            cooldown: 3,
+            time: 30,
+          },
+        ],
+      },
+    })
+    expect(
+      (
+        await fetch(`${CLOUD_TEST_B}/api/quizz/${quiz.id}`, {
+          method: "DELETE",
+          headers: { authorization: `Bearer ${hostToken}` },
+        })
+      ).status,
+    ).toBe(204)
+    expect(
+      (
+        await pool.query<{ game_mode: string; quiz_id: string | null }>(
+          "SELECT game_mode, quiz_id FROM rooms WHERE id = $1",
+          [gameId],
+        )
+      ).rows,
+    ).toEqual([{ game_mode: "quiz", quiz_id: null }])
     owner.process.kill("SIGKILL")
     await expect
       .poll(
@@ -266,6 +314,23 @@ it("takes over a killed coordinator without resetting the round or duplicating a
     )
     expect(after.owner_token).not.toBe(before.owner_token)
     expect(after.closes_at).toEqual(before.closes_at)
+    expect(
+      (
+        await pool.query<Record<string, unknown>>(
+          "SELECT a.*, o.event_id FROM answers a JOIN outbox o USING (round_id, player_id) WHERE a.room_id = $1 ORDER BY a.round_id, a.player_id",
+          [gameId],
+        )
+      ).rows,
+    ).toEqual(committed.rows)
+
+    expect(
+      (
+        await pool.query<{ points: number }>(
+          "SELECT points FROM results WHERE room_id = $1",
+          [gameId],
+        )
+      ).rows,
+    ).toEqual(committedScore)
     const duplicate = nextEvent(first.socket, EVENTS.PLAYER.ANSWER_ACK)
     first.socket.emit(EVENTS.PLAYER.SELECTED_ANSWER, {
       gameId,
@@ -284,7 +349,8 @@ it("takes over a killed coordinator without resetting the round or duplicating a
     await expect(restored).resolves.toMatchObject({
       status: { name: STATUS.WAIT },
       acceptedAnswer: { answerKeys: [0] },
-      player: { points: 0 },
+      gameMode: "quiz",
+      player: { points: 1 },
     })
 
     let resultReceived = false

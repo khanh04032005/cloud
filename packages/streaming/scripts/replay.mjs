@@ -8,13 +8,13 @@ const admin = kafka.admin()
 
 async function snapshot() {
   const scores = await pool.query(
-    "SELECT COALESCE(SUM(points), 0)::integer AS total FROM player_scores",
+    "SELECT room_id, player_id, points FROM results ORDER BY room_id, player_id",
   )
   const rates = await pool.query(
-    "SELECT COALESCE(SUM(answer_count), 0)::integer AS total FROM answer_rate_buckets",
+    "SELECT room_id, bucket_start, answer_count FROM answer_rate_buckets ORDER BY room_id, bucket_start",
   )
 
-  return { points: scores.rows[0].total, acceptedEvents: rates.rows[0].total }
+  return { scores: scores.rows, rates: rates.rows }
 }
 
 try {
@@ -33,12 +33,9 @@ try {
     const before = JSON.parse(await readFile(baselineFile, "utf8"))
     const after = await snapshot()
 
-    if (
-      before.points !== after.points ||
-      before.acceptedEvents !== after.acceptedEvents
-    ) {
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
       throw new Error(
-        `Replay changed totals: ${JSON.stringify({ before, after })}`,
+        `Replay changed stored rows: ${JSON.stringify({ before, after })}`,
       )
     }
 

@@ -22,3 +22,11 @@ packages/e2e
 !packages/e2e/package.json
 **/*.test.ts
 **/test
+
+# hạ tầng và phần của D không nằm trong image
+infra
+role-d
+deploy
+scripts/aws
+compose.*.yml
+*.pdf
