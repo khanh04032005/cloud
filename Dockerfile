@@ -1,5 +1,5 @@
 # ---- BASE ----
-FROM node:24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS node-runtime
+FROM node:24.22.3-alpine3.24@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS node-runtime
 
 FROM node-runtime AS base
 RUN npm install -g pnpm
@@ -28,7 +28,7 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
     && rm -f /out/streaming/src/*.test.mjs /out/streaming/scripts/*.test.mjs
 
 # ---- WEB ----
-FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS nginx-runtime
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS nginx-runtime
 RUN apk upgrade --no-cache && apk add --no-cache nginx
 
 COPY docker/nginx-static.conf /etc/nginx/razzia-static.conf
@@ -66,7 +66,7 @@ CMD ["node", "src/score-worker.mjs"]
 
 # ---- DB MIGRATION ----
 # Chạy một lần trước khi socket khởi động: compose service `migrate`, trên EKS là Helm hook Job.
-FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS migrate
+FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS migrate
 RUN apk add --no-cache postgresql-client
 
 COPY packages/socket/migrations /migrations
